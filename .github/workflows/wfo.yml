@@ -3,9 +3,8 @@ name: WFO Commander
 # This file lives in the PUBLIC repo only. It contains zero strategy code,
 # zero edge logic, zero secrets — just generic install/run/restart plumbing.
 # The actual bot (WfoT9/, user_data/strategies, configs, results, etc.) lives
-# in the PRIVATE repo and is cloned at runtime using a PAT secret that only
-# this workflow has access to. Anyone forking/cloning the public repo gets
-# this YAML and nothing else.
+# in the PRIVATE repo (Miadol) under freqtrade-core/ and is cloned at runtime
+# using a PAT secret. Anyone forking/cloning the public repo gets this YAML only.
 
 on:
   workflow_dispatch:
@@ -27,9 +26,9 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           path: public
 
-      - name: Clone private repo (your code, strategies, edge — never public)
+      - name: Clone private repo (Miadol — your code, strategies, edge)
         run: |
-          git clone https://x-access-token:${{ secrets.FREQTRADE_CORE_PAT }}@github.com/${{ github.repository_owner }}/freqtrade-core.git private
+          git clone https://x-access-token:${{ secrets.FREQTRADE_CORE_PAT }}@github.com/${{ github.repository_owner }}/Miadol.git private
           echo "✅ Private repo cloned"
 
       - name: Set up Python 3.12
@@ -116,7 +115,7 @@ jobs:
       - name: Restore data cache
         uses: actions/cache@v4
         with:
-          path: private/user_data/data
+          path: private/freqtrade-core/user_data/data
           key: freqtrade-data-${{ runner.os }}
           restore-keys: freqtrade-data-
 
@@ -128,21 +127,21 @@ jobs:
           TITAN_BOT_TOKEN: ${{ secrets.TITAN_BOT_TOKEN }}
           TITAN_CHAT_ID: ${{ secrets.TITAN_CHAT_ID }}
         run: |
-          cat > ${{ github.workspace }}/private/WfoT9/.env << EOF
+          cat > ${{ github.workspace }}/private/freqtrade-core/WfoT9/.env << EOF
           TITAN_BOT_TOKEN=${TITAN_BOT_TOKEN}
           TITAN_CHAT_ID=${TITAN_CHAT_ID}
           EOF
 
       - name: Run WFO Commander
         env:
-          TITAN_DB_PATH: ${{ github.workspace }}/private/WfoT9/persist/Ava.sqlite
+          TITAN_DB_PATH: ${{ github.workspace }}/private/freqtrade-core/WfoT9/persist/Ava.sqlite
         run: |
-          cd ${{ github.workspace }}/private/WfoT9
+          cd ${{ github.workspace }}/private/freqtrade-core/WfoT9
           timeout 21180 python main.py || true
 
-      # Push everything back to private repo — configs, results, uploads, DB.
+      # Push everything back to Miadol — configs, results, uploads, DB.
       # git_save.py also commits periodically WHILE main.py runs (every 45s,
-      # only if something changed), so this final push just catches whatever
+      # only if something changed), so this final push catches whatever
       # happened in the last <45s before the runner timeout/restart hit.
       - name: Save all changes back to private repo
         if: always()
