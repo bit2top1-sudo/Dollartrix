@@ -1,0 +1,165 @@
+name: WFO Commander
+
+# This file lives in the PUBLIC repo only. It contains zero strategy code,
+# zero edge logic, zero secrets — just generic install/run/restart plumbing.
+# The actual bot (WfoT9/, user_data/strategies, configs, results, etc.) lives
+# in the PRIVATE repo and is cloned at runtime using a PAT secret that only
+# this workflow has access to. Anyone forking/cloning the public repo gets
+# this YAML and nothing else.
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [restart-wfo]
+
+jobs:
+  run-wfo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: Checkout public repo (workflow scaffolding only)
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: public
+
+      - name: Clone private repo (your code, strategies, edge — never public)
+        run: |
+          git clone https://x-access-token:${{ secrets.FREQTRADE_CORE_PAT }}@github.com/${{ github.repository_owner }}/freqtrade-core.git private
+          echo "✅ Private repo cloned"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Cache the entire pip environment — saves ~5 min every restart
+      - name: Cache pip environment
+        uses: actions/cache@v4
+        id: pip-cache
+        with:
+          path: |
+            ~/.cache/pip
+            /usr/local/lib/python3.12/dist-packages
+            /usr/local/bin/freqtrade
+          key: freqtrade-env-${{ runner.os }}-v3
+          restore-keys: freqtrade-env-${{ runner.os }}-
+
+      # Cache TA-Lib build — saves ~2 min every restart
+      - name: Cache TA-Lib build
+        uses: actions/cache@v4
+        id: talib-cache
+        with:
+          path: |
+            /usr/lib/libta_lib*
+            /usr/include/ta-lib
+          key: talib-${{ runner.os }}-v1
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential libssl-dev libffi-dev python3-dev gcc g++ make cmake
+          pip install --upgrade pip setuptools wheel
+
+      - name: Install TA-Lib
+        if: steps.talib-cache.outputs.cache-hit != 'true'
+        run: |
+          wget -q http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz
+          tar -xzf ta-lib-0.4.0-src.tar.gz
+          cd ta-lib && ./configure --prefix=/usr && make && sudo make install && cd ..
+          pip install TA-Lib
+
+      - name: Install TA-Lib Python binding (cache hit)
+        if: steps.talib-cache.outputs.cache-hit == 'true'
+        run: pip install TA-Lib
+
+      - name: Install Freqtrade + all dependencies
+        if: steps.pip-cache.outputs.cache-hit != 'true'
+        run: |
+          pip install freqtrade
+          pip install hyperopt optuna scikit-learn joblib scipy numpy pandas
+          pip install numba llvmlite
+          pip install catboost xgboost lightgbm
+          pip install aiohttp python-dotenv colorama tabulate rich filelock psutil
+
+      - name: Patch leverage tier loading
+        run: |
+          python3 << 'PATCH_EOF'
+          import re, freqtrade.exchange.exchange as e
+          path = e.__file__
+          with open(path) as f:
+              src = f.read()
+          needle = 'and symbol in self._config.get("exchange", {}).get("pair_whitelist"'
+          if needle in src:
+              print("Already patched — skipping")
+          else:
+              anchor = re.compile(
+                  r'^(?P<indent>[ \t]*)and market\["quote"\] == self\._config\["stake_currency"\]\s*$',
+                  re.MULTILINE,
+              )
+              m = anchor.search(src)
+              if not m:
+                  raise SystemExit("Could not find leverage-tier filter line — freqtrade source changed")
+              indent = m.group("indent")
+              insertion = f'\n{indent}and symbol in self._config.get("exchange", {{}}).get("pair_whitelist", [])'
+              new_src = src[:m.end()] + insertion + src[m.end():]
+              with open(path, "w") as f:
+                  f.write(new_src)
+              print(f"Patched {path}")
+          PATCH_EOF
+
+      # Cache OHLCV data — persists across runs, never redownloads
+      - name: Restore data cache
+        uses: actions/cache@v4
+        with:
+          path: private/user_data/data
+          key: freqtrade-data-${{ runner.os }}
+          restore-keys: freqtrade-data-
+
+      - name: Verify setup
+        run: freqtrade --version
+
+      - name: Write Telegram credentials (.env) — never committed
+        env:
+          TITAN_BOT_TOKEN: ${{ secrets.TITAN_BOT_TOKEN }}
+          TITAN_CHAT_ID: ${{ secrets.TITAN_CHAT_ID }}
+        run: |
+          cat > ${{ github.workspace }}/private/WfoT9/.env << EOF
+          TITAN_BOT_TOKEN=${TITAN_BOT_TOKEN}
+          TITAN_CHAT_ID=${TITAN_CHAT_ID}
+          EOF
+
+      - name: Run WFO Commander
+        env:
+          TITAN_DB_PATH: ${{ github.workspace }}/private/WfoT9/persist/Ava.sqlite
+        run: |
+          cd ${{ github.workspace }}/private/WfoT9
+          timeout 21180 python main.py || true
+
+      # Push everything back to private repo — configs, results, uploads, DB.
+      # git_save.py also commits periodically WHILE main.py runs (every 45s,
+      # only if something changed), so this final push just catches whatever
+      # happened in the last <45s before the runner timeout/restart hit.
+      - name: Save all changes back to private repo
+        if: always()
+        run: |
+          cd ${{ github.workspace }}/private
+          git config user.email "wfo@github-actions"
+          git config user.name "WFO Bot"
+          git add -A
+          git diff --staged --quiet || git commit -m "wfo: save results and uploads $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push || echo "Nothing to push"
+
+      - name: Restart WFO Commander
+        if: always()
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/dispatches \
+            -d '{"event_type":"restart-wfo"}'
+          echo "WFO restart triggered."
