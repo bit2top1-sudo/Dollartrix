@@ -1,0 +1,99 @@
+name: OCI Retry Apply Job
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [retry-oci]
+
+jobs:
+  retry-apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: Checkout public repo (workflow scaffolding only)
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: public
+
+      - name: Clone private repo (Miadol — key.pem, oci_config, oci_notify.py)
+        run: |
+          git clone https://x-access-token:${{ secrets.FREQTRADE_CORE_PAT }}@github.com/${{ github.repository_owner }}/Miadol.git private
+          echo "✅ Private repo cloned"
+
+      - name: Install dependencies
+        run: pip install oci-cli aiohttp
+
+      - name: Configure OCI
+        run: |
+          mkdir -p ~/.oci
+          cp $GITHUB_WORKSPACE/private/key.pem    ~/.oci/key.pem
+          cp $GITHUB_WORKSPACE/private/oci_config ~/.oci/config
+          chmod 600 ~/.oci/key.pem ~/.oci/config
+
+      - name: Try apply job
+        id: apply
+        run: |
+          set +e
+
+          RESULT=$(timeout 60 oci resource-manager job create-apply-job \
+            --stack-id ocid1.ormstack.oc1.iad.amaaaaaayprs6qaaswkbzg3a5oscnp4uluk6ye5jwxfpsjvfe4nx5xqzsxsa \
+            --execution-plan-strategy AUTO_APPROVED 2>&1)
+          EXIT_CODE=$?
+          echo "$RESULT"
+
+          if [ $EXIT_CODE -eq 124 ]; then
+            JOB_STATUS="TIMEOUT"
+            JOB_ID="none"
+          elif echo "$RESULT" | grep -q "ACCEPTED"; then
+            JOB_STATUS="ACCEPTED"
+            JOB_ID=$(echo "$RESULT" | python3 -c \
+              "import sys,json; d=json.load(sys.stdin); print(d['data']['id'])" 2>/dev/null || echo "unknown")
+          else
+            JOB_STATUS="REJECTED"
+            JOB_ID="none"
+          fi
+
+          echo "JOB_STATUS=$JOB_STATUS" >> $GITHUB_ENV
+          echo "JOB_ID=$JOB_ID"         >> $GITHUB_ENV
+          python3 $GITHUB_WORKSPACE/private/oci_notify.py "attempt" "$JOB_STATUS" "$JOB_ID"
+
+          INSTANCE_FOUND="false"
+          if [ "$JOB_STATUS" = "ACCEPTED" ]; then
+            echo "Waiting 3 minutes for provisioning..."
+            sleep 180
+            INSTANCE=$(timeout 30 oci compute instance list \
+              --compartment-id ocid1.tenancy.oc1..aaaaaaaag722dyn6fdv5fxfqhrdhnmrkj4lbuqrh4s4kzargo47batzlqniq \
+              --lifecycle-state RUNNING 2>/dev/null)
+            INSTANCE_ID=$(echo "$INSTANCE" | python3 -c \
+              "import sys,json; d=json.load(sys.stdin); items=d.get('data',[]); print(items[0].get('id','') if items else '')" \
+              2>/dev/null || echo "")
+            if [ -n "$INSTANCE_ID" ]; then
+              INSTANCE_FOUND="true"
+              python3 $GITHUB_WORKSPACE/private/oci_notify.py "success" "$INSTANCE_ID"
+            fi
+          fi
+
+          echo "instance_found=$INSTANCE_FOUND" >> $GITHUB_OUTPUT
+
+      # Mirrors wfo.yml exactly: this step is in the SAME job and uses
+      # if: always(), so it fires no matter what happened above — a failed
+      # pip install, a cp/auth error, an API timeout, or a clean REJECTED
+      # result all lead here. The old design split this into a second job
+      # gated by `needs:`, which GitHub silently AND's with success() unless
+      # you say otherwise — so any failure above used to kill the loop for
+      # good. This can't happen anymore.
+      - name: Schedule next retry
+        if: always() && steps.apply.outputs.instance_found != 'true'
+        run: |
+          sleep 600
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/dispatches \
+            -d '{"event_type":"retry-oci"}'
+          echo "Next OCI retry triggered."
