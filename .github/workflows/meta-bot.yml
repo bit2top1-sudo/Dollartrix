@@ -22,6 +22,7 @@ jobs:
         run: pip install requests
 
       - name: Run meta-bot for ~5h50m
+        id: run
         env:
           META_BOT_TOKEN: ${{ secrets.META_BOT_TOKEN }}
           META_BOT_GITHUB_PAT: ${{ secrets.META_BOT_GITHUB_PAT }}
@@ -31,10 +32,13 @@ jobs:
         run: python3 private/meta_bot.py
 
       # Same if: always() pattern as everything else in this system — fires
-      # no matter what happened above, so a crash never silently ends the
-      # control panel's restart chain.
+      # no matter what happened above, EXCEPT when meta_bot.py itself detected
+      # another instance was already active and deferred. Without this check,
+      # a deferring instance exiting immediately + still dispatching a
+      # replacement would spin up a rapid-fire chain of runs that all
+      # immediately defer to each other — worse than the original duplicate.
       - name: Schedule next run
-        if: always()
+        if: always() && steps.run.outputs.skip_dispatch != 'true'
         run: |
           curl -s -X POST \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
