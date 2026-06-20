@@ -61,6 +61,7 @@ jobs:
           # strategy/pairlist/ROI params, and this bot's secrets.json supplies
           # just its own exchange keys + telegram token on top.
           freqtrade trade \
+            --user-data-dir "$USER_DATA" \
             --config "$BASE_CONFIG_PATH" \
             --config "$SECRETS_CONFIG" \
             --strategy "$STRATEGY_CLASS" \
