@@ -26,7 +26,7 @@ jobs:
 
       - name: Install Freqtrade + deps
         run: |
-          pip install freqtrade
+          pip install "freqtrade[hyperopt]" scipy numba bottleneck scikit-learn statsmodels
           # TA-Lib install verified separately — flagging as a known slow/brittle
           # step on a cold runner; may need apt-get build-essential + the C lib
           # before `pip install ta-lib`, or pip's prebuilt wheel if available.
@@ -122,9 +122,15 @@ jobs:
       - name: Schedule next run
         if: always()
         run: |
-          curl -s -X POST \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${{ github.repository }}/dispatches \
-            -d '{"event_type":"restart-bot-{{BOT_NAME}}"}'
-          echo "Next run of {{BOT_NAME}} triggered."
+          cd private && git pull -q || true
+          BOT_DIR="freqtrade-core/user_data/live_bots/{{BOT_NAME}}"
+          if [ -f "${BOT_DIR}/control.json" ] && grep -q '"paused": *true' "${BOT_DIR}/control.json"; then
+            echo "{{BOT_NAME}} is paused — not scheduling next run. Resume from the meta-bot to restart it."
+          else
+            curl -s -X POST \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              https://api.github.com/repos/${{ github.repository }}/dispatches \
+              -d '{"event_type":"restart-bot-{{BOT_NAME}}"}'
+            echo "Next run of {{BOT_NAME}} triggered."
+          fi
