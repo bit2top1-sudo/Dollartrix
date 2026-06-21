@@ -96,7 +96,7 @@ jobs:
             # delete-db or reload-config task. We never let an outside process
             # kill this run directly; we just check in and decide to stop
             # ourselves, which is what keeps two instances from ever overlapping.
-            git pull -q || true
+            git pull --rebase -q || true
             if [ -f "${BOT_DIR}/control.json" ] && grep -q '"restart_requested": *true' "${BOT_DIR}/control.json"; then
               echo "Early restart requested by meta-bot — stopping after this cycle."
               break
@@ -121,18 +121,50 @@ jobs:
           # Freqtrade has now fully exited and released the file — this is
           # the only point where committing the real $DB_FILE is safe.
           rm -f "${DB_FILE}.snapshot"
-          # Clear the restart signal so it doesn't immediately re-fire next run.
-          rm -f "${BOT_DIR}/control.json"
-          git add "$DB_FILE"
+
+          # Preserve whatever "paused" currently is — only ever reset
+          # restart_requested. Wiping the whole file here was the bug that
+          # made Stop not stick: by the time "Schedule next run" checked for
+          # paused=true, this step had already deleted it.
+          git pull --rebase -q || true
+          if [ -f "${BOT_DIR}/control.json" ]; then
+            PAUSED=$(grep -o '"paused": *true' "${BOT_DIR}/control.json" || echo "")
+          else
+            PAUSED=""
+          fi
+          if [ -n "$PAUSED" ]; then
+            echo '{"paused": true, "restart_requested": false}' > "${BOT_DIR}/control.json"
+          else
+            echo '{"paused": false, "restart_requested": false}' > "${BOT_DIR}/control.json"
+          fi
+
+          # The DB commit is the entire point of this run finishing — it
+          # must not silently fail. Pull-rebase + retry rather than a single
+          # swallowed push attempt, since plenty else is also pushing to
+          # this same repo throughout a 6h run (the watchdog, other bots,
+          # the meta-bot).
+          git add "$DB_FILE" "${BOT_DIR}/control.json"
           git commit -m "autosave: final DB commit before restart - ${BOT_NAME} - $(date -u)" -q || true
-          git push -q || true
+          PUSH_OK=false
+          for attempt in 1 2 3 4 5; do
+            if git push -q; then
+              PUSH_OK=true
+              break
+            fi
+            echo "Push attempt ${attempt} failed — pulling and retrying..."
+            git pull --rebase -q || true
+            sleep $((attempt * 2))
+          done
+          if [ "$PUSH_OK" = false ]; then
+            echo "::error::Final DB commit for ${BOT_NAME} FAILED after 5 attempts — state may not have persisted!"
+          fi
 
       # Same if: always() pattern as retry.yml/wfo.yml — fires no matter what
       # happened above, so a crash never silently ends this bot's restart chain.
       - name: Schedule next run
         if: always()
         run: |
-          cd private && git pull -q || true
+          cd private && git pull --rebase -q || true
           BOT_DIR="freqtrade-core/user_data/live_bots/{{BOT_NAME}}"
           if [ -f "${BOT_DIR}/control.json" ] && grep -q '"paused": *true' "${BOT_DIR}/control.json"; then
             echo "{{BOT_NAME}} is paused — not scheduling next run. Resume from the meta-bot to restart it."
