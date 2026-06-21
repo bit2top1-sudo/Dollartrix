@@ -1,0 +1,146 @@
+name: LiveBot - Ara
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [restart-bot-Ara]
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360          # GitHub's hard cap for a single job — cannot be raised
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: Checkout public scaffold
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: public
+
+      - name: Clone private repo (Miadol)
+        run: |
+          git clone https://x-access-token:${{ secrets.FREQTRADE_CORE_PAT }}@github.com/${{ github.repository_owner }}/Miadol.git private
+
+      - name: Install Freqtrade + deps
+        run: |
+          pip install "freqtrade[hyperopt]" scipy numba bottleneck scikit-learn statsmodels
+          # TA-Lib install verified separately — flagging as a known slow/brittle
+          # step on a cold runner; may need apt-get build-essential + the C lib
+          # before `pip install ta-lib`, or pip's prebuilt wheel if available.
+
+      - name: Run bot for ~5h50m, commit DB every 5min, then handoff to next run
+        env:
+          BOT_NAME: "Ara"
+          BASE_CONFIG: "Emeraldbinance.json"
+          STRATEGY_CLASS: "AthenaV6"
+        run: |
+          set -e
+          cd private
+          git config user.email "livebot@local"
+          git config user.name "LiveBot ${BOT_NAME}"
+
+          # Shared, reusable across every bot — your existing strategy and
+          # config library, untouched and read-only at runtime.
+          USER_DATA="freqtrade-core/user_data"
+          STRATEGY_DIR="${USER_DATA}/strategies"
+          BASE_CONFIG_PATH="${USER_DATA}/configs/${BASE_CONFIG}"
+
+          # Unique per bot — the only things that genuinely can't be shared:
+          # this bot's exchange sub-account keys, its Telegram token, its DB.
+          BOT_DIR="${USER_DATA}/live_bots/${BOT_NAME}"
+          DB_FILE="${BOT_DIR}/tradesv3.sqlite"
+          SECRETS_CONFIG="${BOT_DIR}/secrets.json"
+
+          mkdir -p "$BOT_DIR"
+
+          # Freqtrade merges multiple --config files left-to-right, later
+          # ones overriding earlier ones — so the shared base config supplies
+          # strategy/pairlist/ROI params, and this bot's secrets.json supplies
+          # just its own exchange keys + telegram token on top.
+          freqtrade trade \
+            --user-data-dir "$USER_DATA" \
+            --config "$BASE_CONFIG_PATH" \
+            --config "$SECRETS_CONFIG" \
+            --strategy "$STRATEGY_CLASS" \
+            --strategy-path "$STRATEGY_DIR" \
+            --db-url "sqlite:///$DB_FILE" &
+          FT_PID=$!
+
+          # Watchdog companion — runs in this SAME job (CWD already private/,
+          # unchanged) so it can reach Freqtrade's local REST API directly.
+          # Works identically for dry-run and live since both expose
+          # /balance the same way. Same source file as the meta-bot itself —
+          # this just invokes it in its other mode.
+          python3 meta_bot.py watchdog "$BOT_NAME" "$BOT_DIR" &
+          WATCHDOG_PID=$!
+
+          # Stop 10 minutes before GitHub's unmovable 360-min cap, leaving
+          # real buffer for graceful shutdown + final commit + restart dispatch.
+          # GitHub will hard-kill the whole job at 360min regardless of what's
+          # mid-flight, so this margin is what keeps that from ever happening.
+          STOP_AFTER_SECONDS=$((5*3600 + 50*60))
+          END_TIME=$(( $(date +%s) + STOP_AFTER_SECONDS ))
+
+          while [ "$(date +%s)" -lt "$END_TIME" ]; do
+            sleep 300
+            if ! kill -0 "$FT_PID" 2>/dev/null; then
+              echo "Freqtrade process exited unexpectedly — stopping early."
+              break
+            fi
+
+            # Pull in anything the meta-bot has pushed since this run started —
+            # specifically, a possible early-restart signal from a scheduled
+            # delete-db or reload-config task. We never let an outside process
+            # kill this run directly; we just check in and decide to stop
+            # ourselves, which is what keeps two instances from ever overlapping.
+            git pull -q || true
+            if [ -f "${BOT_DIR}/control.json" ] && grep -q '"restart_requested": *true' "${BOT_DIR}/control.json"; then
+              echo "Early restart requested by meta-bot — stopping after this cycle."
+              break
+            fi
+
+            # Safe hot-backup of a live SQLite DB into a SEPARATE file —
+            # we never touch $DB_FILE itself while Freqtrade still has it
+            # open. This snapshot is just a recovery safety net in case the
+            # final post-shutdown commit below somehow fails.
+            sqlite3 "$DB_FILE" ".backup '${DB_FILE}.snapshot'" 2>/dev/null || true
+            git add "${DB_FILE}.snapshot"
+            git commit -m "autosave: periodic snapshot - ${BOT_NAME} - $(date -u)" -q || true
+            git push -q || true
+          done
+
+          echo "Stopping ${BOT_NAME} gracefully..."
+          kill -TERM "$FT_PID" 2>/dev/null || true
+          wait "$FT_PID" 2>/dev/null || true
+          kill -TERM "$WATCHDOG_PID" 2>/dev/null || true
+          wait "$WATCHDOG_PID" 2>/dev/null || true
+
+          # Freqtrade has now fully exited and released the file — this is
+          # the only point where committing the real $DB_FILE is safe.
+          rm -f "${DB_FILE}.snapshot"
+          # Clear the restart signal so it doesn't immediately re-fire next run.
+          rm -f "${BOT_DIR}/control.json"
+          git add "$DB_FILE"
+          git commit -m "autosave: final DB commit before restart - ${BOT_NAME} - $(date -u)" -q || true
+          git push -q || true
+
+      # Same if: always() pattern as retry.yml/wfo.yml — fires no matter what
+      # happened above, so a crash never silently ends this bot's restart chain.
+      - name: Schedule next run
+        if: always()
+        run: |
+          cd private && git pull -q || true
+          BOT_DIR="freqtrade-core/user_data/live_bots/Ara"
+          if [ -f "${BOT_DIR}/control.json" ] && grep -q '"paused": *true' "${BOT_DIR}/control.json"; then
+            echo "Ara is paused — not scheduling next run. Resume from the meta-bot to restart it."
+          else
+            curl -s -X POST \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              https://api.github.com/repos/${{ github.repository }}/dispatches \
+              -d '{"event_type":"restart-bot-Ara"}'
+            echo "Next run of Ara triggered."
+          fi
