@@ -102,10 +102,43 @@ jobs:
           else:
               print("Warm start: using whatever params file is already there, if any.")
 
-          # --- Build and run the actual hyperopt command ---
-          end = time.strftime("%Y%m%d")
-          start = time.strftime("%Y%m%d", time.localtime(time.time() - lookback_days * 86400))
-          timerange = f"{start}-{end}"
+          # --- Build the timerange the same way auto18.py does: shell out to
+          # the actual `date -d` command rather than computing it in Python.
+          # Freqtrade itself only ever accepts explicit YYYYMMDD-YYYYMMDD on
+          # either approach — there's no relative-days shorthand on its side —
+          # this just matches the tool you're used to, not the final format.
+          def date_d(spec):
+              return subprocess.run(["date", "-d", spec, "+%Y%m%d"],
+                                     capture_output=True, text=True, check=True).stdout.strip()
+
+          end = date_d("today")
+          eval_start = date_d(f"{lookback_days} days ago")
+          timerange = f"{eval_start}-{end}"
+
+          # Indicators need warmup candles BEFORE the evaluation window starts
+          # — without this, the first chunk of the requested range gets
+          # evaluated on incomplete indicators. 10 days is comfortably more
+          # than enough for any startup_candle_count in the thousands on a
+          # 1m timeframe; download-data covers this wider range, hyperopt's
+          # own --timerange stays exactly what was asked for.
+          download_start = date_d(f"{lookback_days + 10} days ago")
+          download_timerange = f"{download_start}-{end}"
+
+          dl_cmd = [
+              "freqtrade", "download-data",
+              "--user-data-dir", USER_DATA,
+              "--config", CONFIG_PATH,
+              "--timerange", download_timerange,
+          ]
+          print("Downloading data:", " ".join(dl_cmd))
+          send_telegram(f"📥 Downloading data for <b>{bot_name}</b> before hyperopt "
+                        f"({download_timerange})...")
+          dl_result = subprocess.run(dl_cmd, capture_output=True, text=True)
+          print(dl_result.stdout[-3000:])
+          print(dl_result.stderr[-2000:])
+          if dl_result.returncode != 0:
+              send_telegram(f"❌ Data download FAILED for <b>{bot_name}</b> — check the Actions log.")
+              sys.exit(1)
 
           cmd = [
               "freqtrade", "hyperopt",
