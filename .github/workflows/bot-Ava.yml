@@ -69,6 +69,14 @@ jobs:
             --db-url "sqlite:///$DB_FILE" &
           FT_PID=$!
 
+          # Watchdog companion — runs in this SAME job (CWD already private/,
+          # unchanged) so it can reach Freqtrade's local REST API directly.
+          # Works identically for dry-run and live since both expose
+          # /balance the same way. Same source file as the meta-bot itself —
+          # this just invokes it in its other mode.
+          python3 meta_bot.py watchdog "$BOT_NAME" "$BOT_DIR" &
+          WATCHDOG_PID=$!
+
           # Stop 10 minutes before GitHub's unmovable 360-min cap, leaving
           # real buffer for graceful shutdown + final commit + restart dispatch.
           # GitHub will hard-kill the whole job at 360min regardless of what's
@@ -107,6 +115,8 @@ jobs:
           echo "Stopping ${BOT_NAME} gracefully..."
           kill -TERM "$FT_PID" 2>/dev/null || true
           wait "$FT_PID" 2>/dev/null || true
+          kill -TERM "$WATCHDOG_PID" 2>/dev/null || true
+          wait "$WATCHDOG_PID" 2>/dev/null || true
 
           # Freqtrade has now fully exited and released the file — this is
           # the only point where committing the real $DB_FILE is safe.
