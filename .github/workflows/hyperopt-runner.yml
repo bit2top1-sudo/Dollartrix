@@ -18,7 +18,27 @@ jobs:
         run: |
           git clone https://x-access-token:${{ secrets.FREQTRADE_CORE_PAT }}@github.com/${{ github.repository_owner }}/Miadol.git private
 
+      - name: Cache pip dependencies
+        # Caches the entire pip site-packages dir between runs of this workflow.
+        # Key includes the Python version so a Python upgrade doesn't serve a
+        # stale cache. On a cache hit the restore step runs in ~5-10s instead
+        # of 60-90s for a fresh install. On a cache miss (first ever run, or
+        # after a Python version bump) it falls through to the install step
+        # below exactly as it always did — no crash, no special handling needed.
+        # The cache is saved at the end of the job only if the install step ran.
+        id: pip-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: freqtrade-hyperopt-${{ runner.os }}-py${{ env.pythonLocation }}-v1
+          restore-keys: |
+            freqtrade-hyperopt-${{ runner.os }}-
+
       - name: Install Freqtrade + deps
+        # Always runs — pip is idempotent and skips packages that are already
+        # present in the restored cache, so a cache hit makes this near-instant.
+        # A cache miss (first run, or cache evicted) installs from scratch as
+        # before. Either way: no crash, correct result.
         run: |
           pip install "freqtrade[hyperopt]" scipy numba bottleneck scikit-learn statsmodels
 
@@ -32,7 +52,7 @@ jobs:
           git config user.name "Hyperopt Runner"
 
           python3 - << 'PYEOF'
-          import json, os, subprocess, sys, shutil, time
+          import json, os, subprocess, sys, shutil, time, glob, urllib.request
 
           payload = json.loads(os.environ["PAYLOAD"])
           bot_name = payload["bot_name"]
@@ -46,6 +66,11 @@ jobs:
           warm_start_mode = payload.get("warm_start_mode", "warm")  # warm | cold | upload
           upload_path = payload.get("upload_path")  # set only if warm_start_mode == "upload"
           reload_after = payload.get("reload_after", False)
+          # spaces: explicit list of tokens e.g. ["buy", "sell", "roi"].
+          # Always required — meta_bot enforces this; no silent "all" fallback.
+          spaces = payload.get("spaces", ["all"])
+          if isinstance(spaces, str):
+              spaces = spaces.split()
 
           USER_DATA = "freqtrade-core/user_data"
           STRATEGY_DIR = f"{USER_DATA}/strategies"
@@ -53,16 +78,22 @@ jobs:
           CONFIG_PATH = f"{USER_DATA}/configs/{base_config}"
           BOT_DIR = f"{USER_DATA}/live_bots/{bot_name}"
           SECRETS_PATH = f"{BOT_DIR}/secrets.json"
+          HYPEROPT_RESULTS_DIR = f"{USER_DATA}/hyperopt_results"
 
-          def send_telegram(text):
+          def _tg_creds():
               try:
                   with open(SECRETS_PATH) as f:
                       secrets = json.load(f)
                   tg = secrets.get("telegram", {})
-                  token, chat_id = tg.get("token"), tg.get("chat_id")
+                  return tg.get("token"), tg.get("chat_id")
+              except Exception:
+                  return None, None
+
+          def send_telegram(text):
+              try:
+                  token, chat_id = _tg_creds()
                   if not token or not chat_id:
                       return
-                  import urllib.request
                   body = json.dumps({"chat_id": chat_id, "text": text, "parse_mode": "HTML"}).encode()
                   req = urllib.request.Request(
                       f"https://api.telegram.org/bot{token}/sendMessage",
@@ -70,6 +101,43 @@ jobs:
                   urllib.request.urlopen(req, timeout=10)
               except Exception as e:
                   print(f"Telegram notify failed (non-fatal): {e}")
+
+          def send_telegram_file(file_path, caption=""):
+              """Send a file to Telegram via sendDocument. Non-fatal on any error."""
+              try:
+                  token, chat_id = _tg_creds()
+                  if not token or not chat_id:
+                      return
+                  if not os.path.exists(file_path):
+                      print(f"send_telegram_file: {file_path} not found, skipping")
+                      return
+                  import mimetypes
+                  boundary = "----HyperoptBoundary"
+                  fname = os.path.basename(file_path)
+                  with open(file_path, "rb") as fh:
+                      file_bytes = fh.read()
+                  mime = mimetypes.guess_type(fname)[0] or "application/octet-stream"
+                  def part(name, value, filename=None, content_type=None):
+                      cd = f'Content-Disposition: form-data; name="{name}"'
+                      if filename:
+                          cd += f'; filename="{filename}"'
+                      ct = f"\r\nContent-Type: {content_type}" if content_type else ""
+                      return f"--{boundary}\r\n{cd}{ct}\r\n\r\n".encode() + (
+                          value if isinstance(value, bytes) else value.encode()) + b"\r\n"
+                  body = (
+                      part("chat_id", str(chat_id)) +
+                      part("caption", caption[:1024]) +
+                      part("document", file_bytes, filename=fname, content_type=mime) +
+                      f"--{boundary}--\r\n".encode()
+                  )
+                  req = urllib.request.Request(
+                      f"https://api.telegram.org/bot{token}/sendDocument",
+                      data=body,
+                      headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+                  urllib.request.urlopen(req, timeout=30)
+                  print(f"Sent file to Telegram: {fname}")
+              except Exception as e:
+                  print(f"Telegram file send failed (non-fatal): {e}")
 
           # --- Warm/cold start handling ---
           # COLD: move the existing params file out of the way so hyperopt
@@ -104,9 +172,6 @@ jobs:
 
           # --- Build the timerange the same way auto18.py does: shell out to
           # the actual `date -d` command rather than computing it in Python.
-          # Freqtrade itself only ever accepts explicit YYYYMMDD-YYYYMMDD on
-          # either approach — there's no relative-days shorthand on its side —
-          # this just matches the tool you're used to, not the final format.
           def date_d(spec):
               return subprocess.run(["date", "-d", spec, "+%Y%m%d"],
                                      capture_output=True, text=True, check=True).stdout.strip()
@@ -140,6 +205,9 @@ jobs:
               send_telegram(f"❌ Data download FAILED for <b>{bot_name}</b> — check the Actions log.")
               sys.exit(1)
 
+          # Snapshot existing .fthypt files so we can identify the new one after.
+          fthypt_before = set(glob.glob(os.path.join(HYPEROPT_RESULTS_DIR, "*.fthypt")))
+
           cmd = [
               "freqtrade", "hyperopt",
               "--user-data-dir", USER_DATA,
@@ -149,50 +217,110 @@ jobs:
               "--hyperopt-loss", loss_function,
               "--epochs", str(epochs),
               "--timerange", timerange,
-              "--spaces", "all",
               "-j", "-1",
           ]
+          # --spaces takes multiple tokens; each must be a separate list element.
+          for s in spaces:
+              cmd += ["--spaces", s]
           if early_stop:
               cmd += ["--early-stop", str(early_stop)]
           if random_state is not None:
               cmd += ["--random-state", str(random_state)]
 
+          spaces_str = " ".join(spaces)
           print("Running:", " ".join(cmd))
           send_telegram(f"🧬 Hyperopt starting for <b>{bot_name}</b> ({strategy_class}, "
-                        f"{epochs} epochs, {loss_function}, {warm_start_mode} start)")
+                        f"{epochs} epochs, {loss_function}, spaces: {spaces_str}, {warm_start_mode} start)")
 
           result = subprocess.run(cmd, capture_output=True, text=True)
-          print(result.stdout[-5000:])
+          stdout_tail = result.stdout[-5000:]
+          print(stdout_tail)
           print(result.stderr[-3000:])
 
           if result.returncode != 0:
               send_telegram(f"❌ Hyperopt FAILED for <b>{bot_name}</b> — check the Actions log.")
               sys.exit(1)
 
-          # Freqtrade exports the best epoch's params to PARAMS_PATH automatically
-          # by default (we never pass --disable-param-export).
-          send_telegram(f"✅ Hyperopt finished for <b>{bot_name}</b>. New params written to "
-                        f"{strategy_class}.json"
-                        + (" — reloading now." if reload_after else
-                           " — will apply on its next scheduled reload or Restart Now."))
+          # --- Parse results table and best epoch from stdout ---
+          # Mirrors the parsing logic in auto18.py: capture lines between the
+          # epoch table header and the "Best result:" summary line.
+          table_lines = []
+          capture = False
+          best_result_line = ""
+          for line in result.stdout.splitlines():
+              if "Epoch" in line and "Trades" in line and "Win" in line:
+                  capture = True
+              if capture and "Best result:" in line:
+                  best_result_line = line.strip()
+                  capture = False
+              if capture:
+                  table_lines.append(line)
+          table_text = "\n".join(table_lines).strip()
+          # Strip non-ASCII box-drawing chars for Telegram compatibility
+          import re
+          table_clean = re.sub(r'[^\x20-\x7E\n]', ' ', table_text)
 
+          # --- Build and send the results summary message ---
+          summary_parts = [f"✅ <b>Hyperopt done</b> — <b>{bot_name}</b> / {strategy_class}",
+                           f"Spaces: {spaces_str} | Loss: {loss_function} | Epochs: {epochs}"]
+          if best_result_line:
+              summary_parts.append(f"\n{best_result_line}")
+          if table_clean:
+              # Telegram message limit 4096; leave room for header
+              table_excerpt = table_clean[-2800:] if len(table_clean) > 2800 else table_clean
+              summary_parts.append(f"\n<pre>{table_excerpt}</pre>")
+          summary_parts.append(
+              "\n" + ("⚡ Reloading config now." if reload_after
+                      else "ℹ️ Will apply on next scheduled reload or Restart Now."))
+          send_telegram("\n".join(summary_parts))
+
+          # --- Send the params .json file ---
+          # Freqtrade exports best epoch params here automatically.
+          send_telegram_file(PARAMS_PATH,
+                             caption=f"📄 Best params — {strategy_class} ({bot_name})")
+
+          # --- Send the .fthypt results file ---
+          # Find whichever .fthypt appeared after we started (newest by mtime).
+          fthypt_after = set(glob.glob(os.path.join(HYPEROPT_RESULTS_DIR, "*.fthypt")))
+          new_fthypts = fthypt_after - fthypt_before
+          if new_fthypts:
+              newest = max(new_fthypts, key=os.path.getmtime)
+              send_telegram_file(newest,
+                                 caption=f"📊 Hyperopt results file — {bot_name} ({strategy_class})")
+          else:
+              print("No new .fthypt file found — skipping file send.")
+
+          # --- reload_after: lightweight watchdog flag, not a full restart ---
           if reload_after:
-              control_path = f"{BOT_DIR}/control.json"
-              with open(control_path, "w") as f:
-                  json.dump({"restart_requested": True, "paused": False}, f)
-              print(f"Wrote restart request to {control_path} for immediate reload.")
+              # Mirrors request_reload_config() in meta_bot.py exactly.
+              watchdog_config_path = f"{BOT_DIR}/watchdog_config.json"
+              try:
+                  with open(watchdog_config_path) as f:
+                      wd_cfg = json.load(f)
+              except (FileNotFoundError, json.JSONDecodeError):
+                  wd_cfg = {}
+              wd_cfg["reload_config_requested"] = True
+              with open(watchdog_config_path, "w") as f:
+                  json.dump(wd_cfg, f)
+              print(f"Set reload_config_requested=True in {watchdog_config_path} — watchdog will pick this up within ~2s.")
           PYEOF
 
-          # Commit whatever changed — new params file, control.json if reload_after,
-          # cold-start backup file. Same pull-rebase-retry pattern as everything
-          # else in this system, since this is a multi-hour job and plenty else
-          # will have pushed to this repo in the meantime.
+          # Commit whatever changed — new params file, watchdog_config.json if
+          # reload_after, cold-start backup file. Same pull-rebase-retry pattern
+          # as everything else in this system.
           git add -A
           git commit -q -m "hyperopt: updated params via Hyperopt Runner" || true
+          PUSH_OK=false
           for attempt in 1 2 3 4 5; do
             if git push -q; then
+              PUSH_OK=true
               break
             fi
+            echo "Push attempt ${attempt} failed — pulling and retrying..."
             git pull --rebase -q || true
+            git add -A  # re-stage anything the pull brought in or rebased over
             sleep $((attempt * 2))
           done
+          if [ "$PUSH_OK" = false ]; then
+            echo "::error::Hyperopt params commit FAILED after 5 attempts — params may not have persisted!"
+          fi
