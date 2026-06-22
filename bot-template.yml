@@ -31,35 +31,61 @@ jobs:
           # step on a cold runner; may need apt-get build-essential + the C lib
           # before `pip install ta-lib`, or pip's prebuilt wheel if available.
 
-      - name: Download previous bot database from artifacts
+      - name: Restore previous bot database
         run: |
+          BOT_DIR="private/freqtrade-core/user_data/live_bots/{{BOT_NAME}}"
+          DB_FILE="${BOT_DIR}/tradesv3.sqlite"
+          mkdir -p "$BOT_DIR"
+
           ARTIFACT_NAME="{{BOT_NAME}}-db"
-          mkdir -p "private/freqtrade-core/user_data/live_bots/{{BOT_NAME}}/"
-          
-          # Fetch artifact list
+          RESTORED_FROM=""
+
+          # --- Primary source: the artifact from the previous run ---
+          # NOTE: the download endpoint's archive_format segment must
+          # literally be "zip" — there is no "/download" path on this API.
+          # ("...actions/artifacts/<id>/download" 404s every time, which is
+          # why every restart was silently falling through to "start fresh".)
           RESPONSE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=${ARTIFACT_NAME}")
-          
-          # Extract artifact ID using grep + sed instead of jq
           ARTIFACT_ID=$(echo "$RESPONSE" | grep -o '"id":[0-9]*' | head -1 | grep -o '[0-9]*')
-          
-          if [ -z "$ARTIFACT_ID" ]; then
-            echo "No artifact found for ${ARTIFACT_NAME} — starting fresh"
-            exit 0
-          fi
-          
-          echo "Found artifact ID: $ARTIFACT_ID — downloading..."
-          curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -L "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}/download" \
-            -o /tmp/artifact.zip
-          
-          if [ -f /tmp/artifact.zip ] && [ -s /tmp/artifact.zip ]; then
-            unzip -o /tmp/artifact.zip -d "private/freqtrade-core/user_data/live_bots/{{BOT_NAME}}/"
+
+          if [ -n "$ARTIFACT_ID" ]; then
+            echo "Found artifact ID: $ARTIFACT_ID — downloading..."
+            HTTP_CODE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -L -w "%{http_code}" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}/zip" \
+              -o /tmp/artifact.zip)
+
+            if [ "$HTTP_CODE" = "200" ] && [ -s /tmp/artifact.zip ]; then
+              if unzip -o /tmp/artifact.zip -d "$BOT_DIR" && [ -s "$DB_FILE" ]; then
+                RESTORED_FROM="artifact"
+                echo "Database restored from artifact."
+              else
+                echo "Artifact downloaded but didn't contain a usable DB."
+              fi
+            else
+              echo "Artifact download failed (HTTP $HTTP_CODE)."
+            fi
             rm -f /tmp/artifact.zip
-            echo "Database restored successfully"
           else
-            echo "Failed to download artifact — starting fresh"
-            exit 0
+            echo "No artifact found for ${ARTIFACT_NAME}."
+          fi
+
+          # --- Fallback source: the periodic git-committed snapshot ---
+          # private/ is already cloned at this point (previous step), so
+          # the most recent ".snapshot" this bot committed during its last
+          # run (every 5 min, right up until shutdown) is sitting on disk
+          # right now. This is what actually saves you if the artifact is
+          # missing/expired/corrupt, or — as has been happening — if the
+          # artifact step itself was broken.
+          if [ -z "$RESTORED_FROM" ] && [ -s "${DB_FILE}.snapshot" ]; then
+            cp "${DB_FILE}.snapshot" "$DB_FILE"
+            RESTORED_FROM="git snapshot"
+            echo "Database restored from git snapshot (${DB_FILE}.snapshot)."
+          fi
+
+          if [ -z "$RESTORED_FROM" ]; then
+            echo "::warning::No previous DB found for {{BOT_NAME}} via artifact or git snapshot — starting fresh. If this bot has run before, this is unexpected."
           fi
 
       - name: Run bot for ~5h50m, commit DB every 5min, then handoff to next run
