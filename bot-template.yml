@@ -126,6 +126,12 @@ jobs:
           # restart_requested. Wiping the whole file here was the bug that
           # made Stop not stick: by the time "Schedule next run" checked for
           # paused=true, this step had already deleted it.
+          #
+          # Stage the DB before pulling — git pull --rebase will refuse to
+          # run if there are unstaged tracked files that the remote has also
+          # touched. Adding it first (even before the commit) makes rebase
+          # treat it as already staged and sidesteps the conflict entirely.
+          git add -f "$DB_FILE"
           git pull --rebase -q || true
           if [ -f "${BOT_DIR}/control.json" ]; then
             PAUSED=$(grep -o '"paused": *true' "${BOT_DIR}/control.json" || echo "")

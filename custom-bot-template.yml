@@ -34,12 +34,35 @@ jobs:
 
           BOT_DIR="freqtrade-core/user_data/custom_bots/${BOT_NAME}"
 
-          # Token lives in the private repo, same as exchange keys do for the
-          # Freqtrade bots — never a GitHub secret, since secrets can't be
-          # created per-bot dynamically without a separate API call+encryption
-          # step for every single bot. This is simpler and just as safe, since
-          # nothing here is reachable outside this one ephemeral runner anyway.
-          export BOT_TOKEN=$(cat "${BOT_DIR}/bot_token.txt")
+          # Token and chat_id live in the private repo, same as exchange keys
+          # do for the Freqtrade bots — never a GitHub secret, since secrets
+          # can't be created per-bot dynamically without a separate API
+          # call+encryption step. This is simpler and just as safe since
+          # nothing here is reachable outside this one ephemeral runner.
+          #
+          # We export under EVERY common env var name that Telegram bot scripts
+          # tend to use. This means any custom bot script works out of the box
+          # regardless of what it calls its token var — no changes to the bot
+          # script ever needed for credential wiring.
+          #
+          # IF A FUTURE CUSTOM BOT'S TELEGRAM ISN'T WORKING: check what env
+          # var name it reads its token/chat_id from (grep for os.getenv or
+          # os.environ in the script), then just add that name to this block.
+          # Each runner job is fully isolated — no cross-bot contamination.
+          _TOKEN=$(cat "${BOT_DIR}/bot_token.txt")
+          _CHAT_ID=$(cat "${BOT_DIR}/chat_id.txt")
+          # Token — all common names
+          export BOT_TOKEN="$_TOKEN"
+          export TELEGRAM_BOT_TOKEN="$_TOKEN"
+          export TELEGRAM_TOKEN="$_TOKEN"
+          export TITAN_BOT_TOKEN="$_TOKEN"
+          export TG_TOKEN="$_TOKEN"
+          export TG_BOT_TOKEN="$_TOKEN"
+          # Chat ID — all common names
+          export CHAT_ID="$_CHAT_ID"
+          export TELEGRAM_CHAT_ID="$_CHAT_ID"
+          export TITAN_CHAT_ID="$_CHAT_ID"
+          export TG_CHAT_ID="$_CHAT_ID"
 
           # Arbitrary script — we genuinely don't know what it does or what
           # it names its own state/db files, unlike the Freqtrade bots where
