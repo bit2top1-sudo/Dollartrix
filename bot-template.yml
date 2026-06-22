@@ -32,12 +32,35 @@ jobs:
           # before `pip install ta-lib`, or pip's prebuilt wheel if available.
 
       - name: Download previous bot database from artifacts
-        uses: dawidd6/action-download-artifact@v2
-        with:
-          workflow: bot-template.yml
-          name: {{BOT_NAME}}-db
-          path: private/freqtrade-core/user_data/live_bots/{{BOT_NAME}}/
-          if_no_artifact_found: ignore
+        run: |
+          ARTIFACT_NAME="{{BOT_NAME}}-db"
+          mkdir -p "private/freqtrade-core/user_data/live_bots/{{BOT_NAME}}/"
+          
+          # Fetch artifact list
+          RESPONSE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=${ARTIFACT_NAME}")
+          
+          # Extract artifact ID using grep + sed instead of jq
+          ARTIFACT_ID=$(echo "$RESPONSE" | grep -o '"id":[0-9]*' | head -1 | grep -o '[0-9]*')
+          
+          if [ -z "$ARTIFACT_ID" ]; then
+            echo "No artifact found for ${ARTIFACT_NAME} — starting fresh"
+            exit 0
+          fi
+          
+          echo "Found artifact ID: $ARTIFACT_ID — downloading..."
+          curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -L "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}/download" \
+            -o /tmp/artifact.zip
+          
+          if [ -f /tmp/artifact.zip ] && [ -s /tmp/artifact.zip ]; then
+            unzip -o /tmp/artifact.zip -d "private/freqtrade-core/user_data/live_bots/{{BOT_NAME}}/"
+            rm -f /tmp/artifact.zip
+            echo "Database restored successfully"
+          else
+            echo "Failed to download artifact — starting fresh"
+            exit 0
+          fi
 
       - name: Run bot for ~5h50m, commit DB every 5min, then handoff to next run
         env:
