@@ -32,11 +32,12 @@ jobs:
           # before `pip install ta-lib`, or pip's prebuilt wheel if available.
 
       - name: Download previous bot database from artifacts
-        uses: actions/download-artifact@v4
+        uses: dawidd6/action-download-artifact@v2
         with:
+          workflow: LiveBot - {{BOT_NAME}}
           name: {{BOT_NAME}}-db
           path: private/freqtrade-core/user_data/live_bots/{{BOT_NAME}}/
-        continue-on-error: true
+          if_no_artifact_found: ignore
 
       - name: Run bot for ~5h50m, commit DB every 5min, then handoff to next run
         env:
