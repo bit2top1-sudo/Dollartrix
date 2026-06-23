@@ -47,7 +47,11 @@ jobs:
           # why every restart was silently falling through to "start fresh".)
           RESPONSE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=${ARTIFACT_NAME}")
-          ARTIFACT_ID=$(echo "$RESPONSE" | grep -o '"id":[0-9]*' | head -1 | grep -o '[0-9]*')
+          # `run:` steps execute under `set -e`. For a brand-new bot with no
+          # artifact yet, grep finds nothing and exits 1, which would kill
+          # this whole step right here before the `if` below ever runs —
+          # so every `grep` in this chain is defused with `|| true`.
+          ARTIFACT_ID=$( (echo "$RESPONSE" | grep -o '"id":[0-9]*' || true) | head -1 | (grep -o '[0-9]*' || true) )
 
           if [ -n "$ARTIFACT_ID" ]; then
             echo "Found artifact ID: $ARTIFACT_ID — downloading..."
