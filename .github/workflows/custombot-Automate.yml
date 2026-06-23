@@ -1,0 +1,144 @@
+name: CustomBot - Automate
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [restart-custombot-Automate]
+
+jobs:
+  run-custom-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360          # GitHub's hard cap for a single job — cannot be raised
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: Clone private repo (Miadol)
+        run: |
+          git clone https://x-access-token:${{ secrets.FREQTRADE_CORE_PAT }}@github.com/${{ github.repository_owner }}/Miadol.git private
+
+      - name: Install this bot's own dependencies
+        run: |
+          cd private/freqtrade-core/user_data/custom_bots/Automate
+          pip install -r requirements.txt
+
+      - name: Run bot for ~5h50m, commit its files every 5min, then handoff to next run
+        env:
+          BOT_NAME: "Automate"
+          AUTOMATE_BOT_TOKEN: ${{ secrets.AUTOMATE_BOT_TOKEN }}
+          AUTOMATE_ENCRYPTION_KEY: ${{ secrets.AUTOMATE_ENCRYPTION_KEY }}
+          AUTOMATE_CHAT_ID: ${{ secrets.AUTOMATE_CHAT_ID }}
+          META_BOT_GITHUB_PAT: ${{ secrets.META_BOT_GITHUB_PAT }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -e
+          cd private
+          git config user.email "custombot@local"
+          git config user.name "CustomBot ${BOT_NAME}"
+
+          BOT_DIR="freqtrade-core/user_data/custom_bots/${BOT_NAME}"
+
+          # Token and chat_id live in the private repo, same as exchange keys
+          # do for the Freqtrade bots — never a GitHub secret, since secrets
+          # can't be created per-bot dynamically without a separate API
+          # call+encryption step. This is simpler and just as safe since
+          # nothing here is reachable outside this one ephemeral runner.
+          #
+          # We export under EVERY common env var name that Telegram bot scripts
+          # tend to use. This means any custom bot script works out of the box
+          # regardless of what it calls its token var — no changes to the bot
+          # script ever needed for credential wiring.
+          #
+          # IF A FUTURE CUSTOM BOT'S TELEGRAM ISN'T WORKING: check what env
+          # var name it reads its token/chat_id from (grep for os.getenv or
+          # os.environ in the script), then just add that name to this block.
+          # Each runner job is fully isolated — no cross-bot contamination.
+          _TOKEN=$(cat "${BOT_DIR}/bot_token.txt")
+          _CHAT_ID=$(cat "${BOT_DIR}/chat_id.txt")
+          # Token — all common names
+          export BOT_TOKEN="$_TOKEN"
+          export TELEGRAM_BOT_TOKEN="$_TOKEN"
+          export TELEGRAM_TOKEN="$_TOKEN"
+          export TITAN_BOT_TOKEN="$_TOKEN"
+          export TG_TOKEN="$_TOKEN"
+          export TG_BOT_TOKEN="$_TOKEN"
+          # Chat ID — all common names
+          export CHAT_ID="$_CHAT_ID"
+          export TELEGRAM_CHAT_ID="$_CHAT_ID"
+          export TITAN_CHAT_ID="$_CHAT_ID"
+          export TG_CHAT_ID="$_CHAT_ID"
+
+          # Arbitrary script — we genuinely don't know what it does or what
+          # it names its own state/db files, unlike the Freqtrade bots where
+          # we control the whole stack. Commit the WHOLE folder rather than
+          # a specific filename, since that's the only thing that's actually
+          # generic enough to work for any script.
+          (cd "$BOT_DIR" && python3 bot.py) &
+          BOT_PID=$!
+
+          STOP_AFTER_SECONDS=$((5*3600 + 50*60))
+          END_TIME=$(( $(date +%s) + STOP_AFTER_SECONDS ))
+
+          while [ "$(date +%s)" -lt "$END_TIME" ]; do
+            sleep 300
+            if ! kill -0 "$BOT_PID" 2>/dev/null; then
+              echo "Bot process exited unexpectedly — stopping early."
+              break
+            fi
+            git pull --rebase -q || true
+            if [ -f "${BOT_DIR}/control.json" ] && grep -q '"restart_requested": *true' "${BOT_DIR}/control.json"; then
+              echo "Early restart requested by meta-bot — stopping after this cycle."
+              break
+            fi
+            git add "$BOT_DIR"
+            git commit -m "autosave: periodic - ${BOT_NAME} - $(date -u)" -q || true
+            git push -q || true
+          done
+
+          echo "Stopping ${BOT_NAME} gracefully..."
+          kill -TERM "$BOT_PID" 2>/dev/null || true
+          wait "$BOT_PID" 2>/dev/null || true
+
+          git pull --rebase -q || true
+          if [ -f "${BOT_DIR}/control.json" ]; then
+            PAUSED=$(grep -o '"paused": *true' "${BOT_DIR}/control.json" || echo "")
+          else
+            PAUSED=""
+          fi
+          if [ -n "$PAUSED" ]; then
+            echo '{"paused": true, "restart_requested": false}' > "${BOT_DIR}/control.json"
+          else
+            echo '{"paused": false, "restart_requested": false}' > "${BOT_DIR}/control.json"
+          fi
+
+          git add "$BOT_DIR"
+          git commit -m "autosave: final commit before restart - ${BOT_NAME} - $(date -u)" -q || true
+          PUSH_OK=false
+          for attempt in 1 2 3 4 5; do
+            if git push -q; then
+              PUSH_OK=true
+              break
+            fi
+            git pull --rebase -q || true
+            sleep $((attempt * 2))
+          done
+          if [ "$PUSH_OK" = false ]; then
+            echo "::error::Final commit for ${BOT_NAME} FAILED after 5 attempts — state may not have persisted!"
+          fi
+
+      - name: Schedule next run
+        if: always()
+        run: |
+          cd private && git pull --rebase -q || true
+          BOT_DIR="freqtrade-core/user_data/custom_bots/Automate"
+          if [ -f "${BOT_DIR}/control.json" ] && grep -q '"paused": *true' "${BOT_DIR}/control.json"; then
+            echo "Automate is paused — not scheduling next run."
+          else
+            curl -s -X POST \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              https://api.github.com/repos/${{ github.repository }}/dispatches \
+              -d '{"event_type":"restart-custombot-Automate"}'
+            echo "Next run of Automate triggered."
+          fi
