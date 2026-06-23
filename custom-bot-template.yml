@@ -26,6 +26,11 @@ jobs:
       - name: Run bot for ~5h50m, commit its files every 5min, then handoff to next run
         env:
           BOT_NAME: "{{BOT_NAME}}"
+          AUTOMATE_BOT_TOKEN: ${{ secrets.AUTOMATE_BOT_TOKEN }}
+          AUTOMATE_ENCRYPTION_KEY: ${{ secrets.AUTOMATE_ENCRYPTION_KEY }}
+          AUTOMATE_CHAT_ID: ${{ secrets.AUTOMATE_CHAT_ID }}
+          META_BOT_GITHUB_PAT: ${{ secrets.META_BOT_GITHUB_PAT }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
           set -e
           cd private
