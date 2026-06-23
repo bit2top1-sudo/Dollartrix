@@ -138,6 +138,13 @@ jobs:
           python3 meta_bot.py watchdog "$BOT_NAME" "$BOT_DIR" &
           WATCHDOG_PID=$!
 
+          # Broadcast relay — also same runner, same source file, third mode.
+          # Freqtrade's own webhook config (set below in secrets.json) posts
+          # every entry/exit/status event to this on 127.0.0.1:9000; it fans
+          # each one out to whatever's configured in broadcast_config.json.
+          python3 meta_bot.py relay "$BOT_NAME" "$BOT_DIR" &
+          RELAY_PID=$!
+
           # Stop 10 minutes before GitHub's unmovable 360-min cap, leaving
           # real buffer for graceful shutdown + final commit + restart dispatch.
           # GitHub will hard-kill the whole job at 360min regardless of what's
@@ -157,6 +164,9 @@ jobs:
             sleep 300
             if ! kill -0 "$FT_PID" 2>/dev/null; then
               echo "Freqtrade process exited unexpectedly — stopping early."
+              curl -s -X POST -H "Content-Type: application/json" \
+                -d '{"type":"status","status":"process died unexpectedly"}' \
+                http://127.0.0.1:9000/internal/broadcast >/dev/null 2>&1 || true
               break
             fi
 
@@ -194,6 +204,8 @@ jobs:
           wait "$FT_PID" 2>/dev/null || true
           kill -TERM "$WATCHDOG_PID" 2>/dev/null || true
           wait "$WATCHDOG_PID" 2>/dev/null || true
+          kill -TERM "$RELAY_PID" 2>/dev/null || true
+          wait "$RELAY_PID" 2>/dev/null || true
 
           # Freqtrade has now fully exited and released the file — this is
           # the only point where the DB is safe to read/upload.
