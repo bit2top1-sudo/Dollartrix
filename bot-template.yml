@@ -97,6 +97,9 @@ jobs:
           BOT_NAME: "{{BOT_NAME}}"
           BASE_CONFIG: "{{BASE_CONFIG}}"
           STRATEGY_CLASS: "{{STRATEGY_CLASS}}"
+          META_BOT_TOKEN: ${{ secrets.META_BOT_TOKEN }}
+          META_BOT_GITHUB_PAT: ${{ secrets.META_BOT_GITHUB_PAT }}
+          OWNER_CHAT_ID: ${{ secrets.OWNER_CHAT_ID }}
         run: |
           set -e
           cd private
