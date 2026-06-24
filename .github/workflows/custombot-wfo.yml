@@ -94,6 +94,13 @@ jobs:
           WFO_DIR="freqtrade-core/user_data/custom_bots/wfo"
           USER_DATA="freqtrade-core/user_data"
 
+          # ── Verify WFO directory structure exists ──────────────────────────
+          if [ ! -f "${WFO_DIR}/main.py" ]; then
+            echo "❌ ERROR: WFO main.py not found at ${WFO_DIR}/main.py"
+            ls -la "${WFO_DIR}/" || echo "Directory does not exist!"
+            exit 1
+          fi
+
           # ── Inject Telegram credentials ───────────────────────────────────
           # Titan WFO reads TITAN_BOT_TOKEN and TITAN_CHAT_ID from env.
           # These are stored as bot_token.txt and chat_id.txt in the private
@@ -125,11 +132,14 @@ jobs:
           # GitHub runners which is ephemeral, but be explicit just in case.
           rm -f /tmp/adb30_wfo_commander.lock
 
-          # ── Start WFO ─────────────────────────────────────────────────────
-          cd "${WFO_DIR}"
-          python3 main.py &
+          # ── Start WFO from parent directory (NOT from within wfo/) ────────
+          # FIX v31: Do NOT cd into WFO_DIR. Instead, set PYTHONPATH and run
+          # with full path. This ensures main.py can import config, handlers,
+          # etc. without import errors, and the working directory stays correct
+          # for all relative path operations.
+          export PYTHONPATH="${WFO_DIR}:${PYTHONPATH}"
+          python3 "${WFO_DIR}/main.py" &
           WFO_PID=$!
-          cd ../../../..   # back to private/
 
           STOP_AFTER_SECONDS=$((5*3600 + 50*60))
           END_TIME=$(( $(date +%s) + STOP_AFTER_SECONDS ))
