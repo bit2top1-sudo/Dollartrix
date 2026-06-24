@@ -91,7 +91,7 @@ jobs:
           git config user.email "wfo@local"
           git config user.name "WFO Bot"
 
-          WFO_DIR="freqtrade-core/user_data/custom_bots/wfo"
+          WFO_DIR="freqtrade-core/user_data/custom_bots/Wfo"
           USER_DATA="freqtrade-core/user_data"
 
           # ── Verify WFO directory structure exists ──────────────────────────
@@ -132,7 +132,7 @@ jobs:
           # GitHub runners which is ephemeral, but be explicit just in case.
           rm -f /tmp/adb30_wfo_commander.lock
 
-          # ── Start WFO from parent directory (NOT from within wfo/) ────────
+          # ── Start WFO from parent directory (NOT from within Wfo/) ────────
           # FIX v31: Do NOT cd into WFO_DIR. Instead, set PYTHONPATH and run
           # with full path. This ensures main.py can import config, handlers,
           # etc. without import errors, and the working directory stays correct
