@@ -132,13 +132,21 @@ jobs:
         run: |
           cd private && git pull --rebase -q || true
           BOT_DIR="freqtrade-core/user_data/custom_bots/{{BOT_NAME}}"
+
           if [ -f "${BOT_DIR}/control.json" ] && grep -q '"paused": *true' "${BOT_DIR}/control.json"; then
             echo "{{BOT_NAME}} is paused — not scheduling next run."
-          else
-            curl -s -X POST \
-              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              https://api.github.com/repos/${{ github.repository }}/dispatches \
-              -d '{"event_type":"restart-custombot-{{BOT_NAME}}"}'
-            echo "Next run of {{BOT_NAME}} triggered."
+            exit 0
           fi
+
+          if [ -f "${BOT_DIR}/control.json" ] && grep -q '"meta_restart": *true' "${BOT_DIR}/control.json"; then
+            echo "Meta-bot is handling this restart — skipping self-dispatch."
+            exit 0
+          fi
+
+          echo "No meta-bot claim found — self-dispatching as fallback."
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/dispatches \
+            -d '{"event_type":"restart-custombot-{{BOT_NAME}}"}'
+          echo "Next run of {{BOT_NAME}} triggered."
