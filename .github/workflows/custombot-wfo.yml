@@ -62,10 +62,14 @@ jobs:
             echo "No OHLCV artifact found — first run or artifact expired. WFO will download data as needed."
           fi
 
-      # ── Install full Freqtrade stack (WFO calls freqtrade as subprocess) ─
+      # ── Install full stack (Freqtrade + hyperopt + WFO deps) ─────────────
+      # WFO calls freqtrade as a subprocess so it needs the full stack.
+      # WFO's own Python deps (aiohttp, python-dotenv, numpy) are included
+      # here directly — no separate requirements.txt step needed.
       - name: Install Freqtrade + hyperopt deps
         run: |
-          pip install "freqtrade[hyperopt]" scipy numba bottleneck scikit-learn statsmodels
+          pip install "freqtrade[hyperopt]" scipy numba bottleneck scikit-learn statsmodels \
+            aiohttp python-dotenv numpy
           # TA-Lib: try prebuilt wheel first; fall back to building from source.
           pip install ta-lib 2>/dev/null || (
             sudo apt-get install -y build-essential wget &&
@@ -74,11 +78,6 @@ jobs:
             cd ta-lib && ./configure --prefix=/usr && make -j2 && sudo make install && cd .. &&
             pip install ta-lib
           )
-
-      # ── Install WFO's own Python deps ────────────────────────────────────
-      - name: Install WFO dependencies
-        run: |
-          pip install -r private/freqtrade-core/user_data/custom_bots/wfo/requirements.txt
 
       # ── Main run loop ─────────────────────────────────────────────────────
       - name: Run WFO for ~5h50m, commit state every 5min, then handoff
