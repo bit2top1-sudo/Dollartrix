@@ -244,20 +244,39 @@ jobs:
           retention-days: 90
           if-no-files-found: ignore
 
-      # Same if: always() pattern as retry.yml/wfo.yml — fires no matter what
-      # happened above, so a crash never silently ends this bot's restart chain.
+      # Schedule next run — only fires if meta-bot has NOT claimed this restart.
+      # Meta-bot writes "meta_restart": true to control.json before cancelling
+      # this run, so by the time this step executes (after cancellation or natural
+      # exit) we can tell whether meta-bot is handling the restart or we should
+      # self-dispatch as a fallback (e.g. if meta-bot is itself down).
       - name: Schedule next run
         if: always()
         run: |
           cd private && git pull --rebase -q || true
           BOT_DIR="freqtrade-core/user_data/live_bots/{{BOT_NAME}}"
+
+          # Never restart a paused bot — that requires explicit Resume from meta-bot.
           if [ -f "${BOT_DIR}/control.json" ] && grep -q '"paused": *true' "${BOT_DIR}/control.json"; then
-            echo "{{BOT_NAME}} is paused — not scheduling next run. Resume from the meta-bot to restart it."
-          else
-            curl -s -X POST \
-              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              https://api.github.com/repos/${{ github.repository }}/dispatches \
-              -d '{"event_type":"restart-bot-{{BOT_NAME}}"}'
-            echo "Next run of {{BOT_NAME}} triggered."
+            echo "{{BOT_NAME}} is paused — not scheduling next run."
+            exit 0
           fi
+
+          # If meta-bot has claimed this restart cycle, skip self-dispatch.
+          # Meta-bot writes "meta_restart": true before it cancels or signals
+          # this run, then clears it after dispatching the new run itself.
+          # This is what makes meta-bot the sole restart authority while still
+          # allowing self-restart as a genuine fallback when meta-bot is down.
+          if [ -f "${BOT_DIR}/control.json" ] && grep -q '"meta_restart": *true' "${BOT_DIR}/control.json"; then
+            echo "Meta-bot is handling this restart — skipping self-dispatch."
+            exit 0
+          fi
+
+          # Meta-bot is not present — self-dispatch as fallback to keep the
+          # bot alive. This only fires if meta-bot missed this cycle entirely.
+          echo "No meta-bot claim found — self-dispatching as fallback."
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/dispatches \
+            -d '{"event_type":"restart-bot-{{BOT_NAME}}"}'
+          echo "Next run of {{BOT_NAME}} triggered."
