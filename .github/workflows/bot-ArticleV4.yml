@@ -1,0 +1,282 @@
+name: LiveBot - ArticleV4
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [restart-bot-ArticleV4]
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360          # GitHub's hard cap for a single job — cannot be raised
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: Checkout public scaffold
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: public
+
+      - name: Clone private repo (Miadol)
+        run: |
+          git clone https://x-access-token:${{ secrets.FREQTRADE_CORE_PAT }}@github.com/${{ github.repository_owner }}/Miadol.git private
+
+      - name: Install Freqtrade + deps
+        run: |
+          pip install "freqtrade[hyperopt]" scipy numba bottleneck scikit-learn statsmodels
+          # TA-Lib install verified separately — flagging as a known slow/brittle
+          # step on a cold runner; may need apt-get build-essential + the C lib
+          # before `pip install ta-lib`, or pip's prebuilt wheel if available.
+
+      - name: Restore previous bot database
+        run: |
+          BOT_DIR="private/freqtrade-core/user_data/live_bots/ArticleV4"
+          DB_FILE="${BOT_DIR}/tradesv3.sqlite"
+          mkdir -p "$BOT_DIR"
+
+          ARTIFACT_NAME="ArticleV4-db"
+          RESTORED_FROM=""
+
+          # --- Primary source: the artifact from the previous run ---
+          # NOTE: the download endpoint's archive_format segment must
+          # literally be "zip" — there is no "/download" path on this API.
+          # ("...actions/artifacts/<id>/download" 404s every time, which is
+          # why every restart was silently falling through to "start fresh".)
+          RESPONSE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=${ARTIFACT_NAME}")
+          # `run:` steps execute under `set -e`. For a brand-new bot with no
+          # artifact yet, grep finds nothing and exits 1, which would kill
+          # this whole step right here before the `if` below ever runs —
+          # so every `grep` in this chain is defused with `|| true`.
+          ARTIFACT_ID=$( (echo "$RESPONSE" | grep -o '"id":[0-9]*' || true) | head -1 | (grep -o '[0-9]*' || true) )
+
+          if [ -n "$ARTIFACT_ID" ]; then
+            echo "Found artifact ID: $ARTIFACT_ID — downloading..."
+            HTTP_CODE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -L -w "%{http_code}" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}/zip" \
+              -o /tmp/artifact.zip)
+
+            if [ "$HTTP_CODE" = "200" ] && [ -s /tmp/artifact.zip ]; then
+              if unzip -o /tmp/artifact.zip -d "$BOT_DIR" && [ -s "$DB_FILE" ]; then
+                RESTORED_FROM="artifact"
+                echo "Database restored from artifact."
+              else
+                echo "Artifact downloaded but didn't contain a usable DB."
+              fi
+            else
+              echo "Artifact download failed (HTTP $HTTP_CODE)."
+            fi
+            rm -f /tmp/artifact.zip
+          else
+            echo "No artifact found for ${ARTIFACT_NAME}."
+          fi
+
+          # --- Fallback source: the periodic git-committed snapshot ---
+          # private/ is already cloned at this point (previous step), so
+          # the most recent ".snapshot" this bot committed during its last
+          # run (every 5 min, right up until shutdown) is sitting on disk
+          # right now. This is what actually saves you if the artifact is
+          # missing/expired/corrupt, or — as has been happening — if the
+          # artifact step itself was broken.
+          if [ -z "$RESTORED_FROM" ] && [ -s "${DB_FILE}.snapshot" ]; then
+            cp "${DB_FILE}.snapshot" "$DB_FILE"
+            RESTORED_FROM="git snapshot"
+            echo "Database restored from git snapshot (${DB_FILE}.snapshot)."
+          fi
+
+          if [ -z "$RESTORED_FROM" ]; then
+            echo "::warning::No previous DB found for ArticleV4 via artifact or git snapshot — starting fresh. If this bot has run before, this is unexpected."
+          fi
+
+      - name: Run bot for ~5h50m, commit DB every 5min, then handoff to next run
+        env:
+          BOT_NAME: "ArticleV4"
+          BASE_CONFIG: "Ava.json"
+          STRATEGY_CLASS: "ArticleV4"
+          META_BOT_TOKEN: ${{ secrets.META_BOT_TOKEN }}
+          META_BOT_GITHUB_PAT: ${{ secrets.META_BOT_GITHUB_PAT }}
+          OWNER_CHAT_ID: ${{ secrets.OWNER_CHAT_ID }}
+        run: |
+          set -e
+          cd private
+          git config user.email "livebot@local"
+          git config user.name "LiveBot ${BOT_NAME}"
+
+          # Shared, reusable across every bot — your existing strategy and
+          # config library, untouched and read-only at runtime.
+          USER_DATA="freqtrade-core/user_data"
+          STRATEGY_DIR="${USER_DATA}/strategies"
+          BASE_CONFIG_PATH="${USER_DATA}/configs/${BASE_CONFIG}"
+
+          # Unique per bot — the only things that genuinely can't be shared:
+          # this bot's exchange sub-account keys, its Telegram token, its DB.
+          BOT_DIR="${USER_DATA}/live_bots/${BOT_NAME}"
+          DB_FILE="${BOT_DIR}/tradesv3.sqlite"
+          SECRETS_CONFIG="${BOT_DIR}/secrets.json"
+
+          mkdir -p "$BOT_DIR"
+
+          # Freqtrade merges multiple --config files left-to-right, later
+          # ones overriding earlier ones — so the shared base config supplies
+          # strategy/pairlist/ROI params, and this bot's secrets.json supplies
+          # just its own exchange keys + telegram token on top.
+          freqtrade trade \
+            --user-data-dir "$USER_DATA" \
+            --config "$BASE_CONFIG_PATH" \
+            --config "$SECRETS_CONFIG" \
+            --strategy "$STRATEGY_CLASS" \
+            --strategy-path "$STRATEGY_DIR" \
+            --db-url "sqlite:///$DB_FILE" &
+          FT_PID=$!
+
+          # Watchdog companion — runs in this SAME job (CWD already private/,
+          # unchanged) so it can reach Freqtrade's local REST API directly.
+          # Works identically for dry-run and live since both expose
+          # /balance the same way. Same source file as the meta-bot itself —
+          # this just invokes it in its other mode.
+          python3 meta_bot.py watchdog "$BOT_NAME" "$BOT_DIR" &
+          WATCHDOG_PID=$!
+
+          # Broadcast relay — also same runner, same source file, third mode.
+          # Freqtrade's own webhook config (set below in secrets.json) posts
+          # every entry/exit/status event to this on 127.0.0.1:9000; it fans
+          # each one out to whatever's configured in broadcast_config.json.
+          python3 meta_bot.py relay "$BOT_NAME" "$BOT_DIR" &
+          RELAY_PID=$!
+
+          # Stop 10 minutes before GitHub's unmovable 360-min cap, leaving
+          # real buffer for graceful shutdown + final commit + restart dispatch.
+          # GitHub will hard-kill the whole job at 360min regardless of what's
+          # mid-flight, so this margin is what keeps that from ever happening.
+          STOP_AFTER_SECONDS=$((5*3600 + 50*60))
+          END_TIME=$(( $(date +%s) + STOP_AFTER_SECONDS ))
+
+          # Local signal file — written by this shell loop after each git pull,
+          # read by the watchdog directly off disk. Avoids the GitHub round-trip
+          # latency (can be minutes) that would otherwise gate a time-sensitive
+          # in-place reload. /tmp is on the runner's local tmpfs: zero network,
+          # effectively instant. The watchdog checks this file every 2s poll and
+          # acts on it immediately, then clears both the file and the git flag.
+          RELOAD_SIGNAL="/tmp/ft_reload_config_${BOT_NAME}"
+
+          while [ "$(date +%s)" -lt "$END_TIME" ]; do
+            sleep 300
+            if ! kill -0 "$FT_PID" 2>/dev/null; then
+              echo "Freqtrade process exited unexpectedly — stopping early."
+              curl -s -X POST -H "Content-Type: application/json" \
+                -d '{"type":"status","status":"process died unexpectedly"}' \
+                http://127.0.0.1:9000/internal/broadcast >/dev/null 2>&1 || true
+              break
+            fi
+
+            # Pull in anything the meta-bot has pushed since this run started —
+            # specifically, a possible early-restart signal from a scheduled
+            # delete-db or reload-config task. We never let an outside process
+            # kill this run directly; we just check in and decide to stop
+            # ourselves, which is what keeps two instances from ever overlapping.
+            git pull --rebase -q || true
+            if [ -f "${BOT_DIR}/control.json" ] && grep -q '"restart_requested": *true' "${BOT_DIR}/control.json"; then
+              echo "Early restart requested by meta-bot — stopping after this cycle."
+              break
+            fi
+
+            # After pulling, forward the reload_config flag to the watchdog via
+            # a local file. The watchdog reads this on its next 2s poll and acts
+            # immediately — no further git round-trip needed on its side.
+            if [ -f "${BOT_DIR}/watchdog_config.json" ] && \
+               grep -q '"reload_config_requested": *true' "${BOT_DIR}/watchdog_config.json"; then
+              touch "$RELOAD_SIGNAL"
+            fi
+
+            # Safe hot-backup of a live SQLite DB into a SEPARATE file —
+            # we never touch $DB_FILE itself while Freqtrade still has it
+            # open. This snapshot is committed to Git as a safety recovery net
+            # only; the actual live DB state is persisted via artifacts.
+            sqlite3 "$DB_FILE" ".backup '${DB_FILE}.snapshot'" 2>/dev/null || true
+            git add "${DB_FILE}.snapshot"
+            git commit -m "autosave: periodic snapshot - ${BOT_NAME} - $(date -u)" -q || true
+            git push -q || true
+          done
+
+          echo "Stopping ${BOT_NAME} gracefully..."
+          kill -TERM "$FT_PID" 2>/dev/null || true
+          wait "$FT_PID" 2>/dev/null || true
+          kill -TERM "$WATCHDOG_PID" 2>/dev/null || true
+          wait "$WATCHDOG_PID" 2>/dev/null || true
+          kill -TERM "$RELAY_PID" 2>/dev/null || true
+          wait "$RELAY_PID" 2>/dev/null || true
+
+          # Freqtrade has now fully exited and released the file — this is
+          # the only point where the DB is safe to read/upload.
+          rm -f "${DB_FILE}.snapshot"
+
+          # Update control.json for paused state (preserve "paused" flag if set)
+          git pull --rebase -q || true
+          if [ -f "${BOT_DIR}/control.json" ]; then
+            PAUSED=$(grep -o '"paused": *true' "${BOT_DIR}/control.json" || echo "")
+          else
+            PAUSED=""
+          fi
+          if [ -n "$PAUSED" ]; then
+            echo '{"paused": true, "restart_requested": false}' > "${BOT_DIR}/control.json"
+          else
+            echo '{"paused": false, "restart_requested": false}' > "${BOT_DIR}/control.json"
+          fi
+
+          # Commit control.json to Git (metadata only, no binary DB file)
+          git add "${BOT_DIR}/control.json"
+          git commit -m "autosave: control state for ${BOT_NAME} - $(date -u)" -q || true
+          git push -q || true
+
+      # Upload the live database as an artifact for the next run to download
+      # This avoids Git merge conflicts on binary files and ensures seamless persistence
+      - name: Upload database artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ArticleV4-db
+          path: private/freqtrade-core/user_data/live_bots/ArticleV4/tradesv3.sqlite
+          overwrite: true
+          retention-days: 90
+          if-no-files-found: ignore
+
+      # Schedule next run — only fires if meta-bot has NOT claimed this restart.
+      # Meta-bot writes "meta_restart": true to control.json before cancelling
+      # this run, so by the time this step executes (after cancellation or natural
+      # exit) we can tell whether meta-bot is handling the restart or we should
+      # self-dispatch as a fallback (e.g. if meta-bot is itself down).
+      - name: Schedule next run
+        if: always()
+        run: |
+          cd private && git pull --rebase -q || true
+          BOT_DIR="freqtrade-core/user_data/live_bots/ArticleV4"
+
+          # Never restart a paused bot — that requires explicit Resume from meta-bot.
+          if [ -f "${BOT_DIR}/control.json" ] && grep -q '"paused": *true' "${BOT_DIR}/control.json"; then
+            echo "ArticleV4 is paused — not scheduling next run."
+            exit 0
+          fi
+
+          # If meta-bot has claimed this restart cycle, skip self-dispatch.
+          # Meta-bot writes "meta_restart": true before it cancels or signals
+          # this run, then clears it after dispatching the new run itself.
+          # This is what makes meta-bot the sole restart authority while still
+          # allowing self-restart as a genuine fallback when meta-bot is down.
+          if [ -f "${BOT_DIR}/control.json" ] && grep -q '"meta_restart": *true' "${BOT_DIR}/control.json"; then
+            echo "Meta-bot is handling this restart — skipping self-dispatch."
+            exit 0
+          fi
+
+          # Meta-bot is not present — self-dispatch as fallback to keep the
+          # bot alive. This only fires if meta-bot missed this cycle entirely.
+          echo "No meta-bot claim found — self-dispatching as fallback."
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/dispatches \
+            -d '{"event_type":"restart-bot-ArticleV4"}'
+          echo "Next run of ArticleV4 triggered."
