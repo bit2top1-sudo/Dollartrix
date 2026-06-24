@@ -30,12 +30,49 @@ jobs:
           PUBLIC_REPO: ${{ github.event.repository.name }}
         run: python3 private/meta_bot.py
 
-      # Same if: always() pattern as everything else in this system — fires
-      # no matter what happened above, so a crash never silently ends the
-      # control panel's restart chain.
-      - name: Schedule next run
+      # Sleep until the next fixed restart window (:50 of 00, 06, 12, 18 Lagos time)
+      # before re-dispatching meta-bot, so it always wakes at a predictable wall-clock
+      # time and can sync all trading bots to the same rhythm.
+      # Windows are 01:00, 07:00, 13:00, 19:00 Lagos — meta-bot wakes at :50 before each.
+      - name: Sleep until next window then schedule next run
         if: always()
         run: |
+          # Target minutes-past-midnight (Lagos) for meta-bot wakeups: 50, 430, 770, 1110
+          # i.e. 00:50, 06:50, 12:50, 18:50
+          WINDOWS="50 430 770 1110"
+
+          # Get current Lagos time as minutes since midnight
+          NOW_MINUTES=$(TZ="Africa/Lagos" date +"%H * 60 + %M" | bc)
+
+          # Find the next window strictly after now
+          NEXT=-1
+          for W in $WINDOWS; do
+            if [ "$W" -gt "$NOW_MINUTES" ]; then
+              NEXT=$W
+              break
+            fi
+          done
+
+          # If no window today is in the future, take the first window tomorrow
+          if [ "$NEXT" -eq -1 ]; then
+            NEXT=50
+            SLEEP_SECONDS=$(( (1440 - NOW_MINUTES + NEXT) * 60 ))
+          else
+            SLEEP_SECONDS=$(( (NEXT - NOW_MINUTES) * 60 ))
+          fi
+
+          # Never sleep more than 6h10m — sanity cap in case of clock weirdness
+          MAX_SLEEP=$(( 6 * 3600 + 10 * 60 ))
+          if [ "$SLEEP_SECONDS" -gt "$MAX_SLEEP" ]; then
+            SLEEP_SECONDS=$MAX_SLEEP
+          fi
+
+          WAKE_TIME=$(TZ="Africa/Lagos" date -d "+${SLEEP_SECONDS} seconds" "+%H:%M Lagos" 2>/dev/null \
+            || TZ="Africa/Lagos" date -v "+${SLEEP_SECONDS}S" "+%H:%M Lagos" 2>/dev/null \
+            || echo "unknown")
+          echo "Sleeping ${SLEEP_SECONDS}s — waking at ~${WAKE_TIME}"
+          sleep "$SLEEP_SECONDS"
+
           curl -s -X POST \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github.v3+json" \
