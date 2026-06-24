@@ -1,0 +1,273 @@
+name: CustomBot - wfo
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [restart-custombot-wfo]
+
+jobs:
+  run-custom-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: Checkout public scaffold
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: public
+
+      - name: Clone private repo (Miadol)
+        run: |
+          git clone https://x-access-token:${{ secrets.FREQTRADE_CORE_PAT }}@github.com/${{ github.repository_owner }}/Miadol.git private
+
+      # ── Restore OHLCV data from artifact ─────────────────────────────────
+      # The data folder is ~700MB — too large for git. We persist it via
+      # artifact instead. On first ever run the artifact won't exist yet and
+      # WFO's auto-download will fetch whatever it needs during the run.
+      - name: Restore OHLCV data artifact
+        run: |
+          DATA_DIR="private/freqtrade-core/user_data/data"
+          mkdir -p "$DATA_DIR"
+
+          ARTIFACT_NAME="wfo-ohlcv-data"
+          RESPONSE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=${ARTIFACT_NAME}")
+          ARTIFACT_ID=$( (echo "$RESPONSE" | grep -o '"id":[0-9]*' || true) | head -1 | (grep -o '[0-9]*' || true) )
+
+          if [ -n "$ARTIFACT_ID" ]; then
+            echo "Found OHLCV artifact ID: $ARTIFACT_ID — downloading..."
+            HTTP_CODE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -L -w "%{http_code}" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}/zip" \
+              -o /tmp/ohlcv_artifact.zip)
+            if [ "$HTTP_CODE" = "200" ] && [ -s /tmp/ohlcv_artifact.zip ]; then
+              # The artifact is a zip-of-a-zip: outer GitHub wrapper contains
+              # our inner ohlcv_data.tar.gz which we extract into data/.
+              unzip -o /tmp/ohlcv_artifact.zip -d /tmp/ohlcv_extracted || true
+              if [ -f /tmp/ohlcv_extracted/ohlcv_data.tar.gz ]; then
+                tar -xzf /tmp/ohlcv_extracted/ohlcv_data.tar.gz -C "$DATA_DIR"
+                echo "OHLCV data restored ($(du -sh $DATA_DIR | cut -f1))."
+              else
+                echo "::warning::Artifact downloaded but ohlcv_data.tar.gz not found inside."
+              fi
+            else
+              echo "::warning::OHLCV artifact download failed (HTTP $HTTP_CODE) — WFO will auto-download data as needed."
+            fi
+            rm -f /tmp/ohlcv_artifact.zip
+          else
+            echo "No OHLCV artifact found — first run or artifact expired. WFO will download data as needed."
+          fi
+
+      # ── Install full Freqtrade stack (WFO calls freqtrade as subprocess) ─
+      - name: Install Freqtrade + hyperopt deps
+        run: |
+          pip install "freqtrade[hyperopt]" scipy numba bottleneck scikit-learn statsmodels
+          # TA-Lib: try prebuilt wheel first; fall back to building from source.
+          pip install ta-lib 2>/dev/null || (
+            sudo apt-get install -y build-essential wget &&
+            wget -q http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz &&
+            tar -xzf ta-lib-0.4.0-src.tar.gz &&
+            cd ta-lib && ./configure --prefix=/usr && make -j2 && sudo make install && cd .. &&
+            pip install ta-lib
+          )
+
+      # ── Install WFO's own Python deps ────────────────────────────────────
+      - name: Install WFO dependencies
+        run: |
+          pip install -r private/freqtrade-core/user_data/custom_bots/wfo/requirements.txt
+
+      # ── Main run loop ─────────────────────────────────────────────────────
+      - name: Run WFO for ~5h50m, commit state every 5min, then handoff
+        env:
+          BOT_NAME: "wfo"
+          META_BOT_GITHUB_PAT: ${{ secrets.META_BOT_GITHUB_PAT }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -e
+          cd private
+          git config user.email "wfo@local"
+          git config user.name "WFO Bot"
+
+          WFO_DIR="freqtrade-core/user_data/custom_bots/wfo"
+          USER_DATA="freqtrade-core/user_data"
+
+          # ── Inject Telegram credentials ───────────────────────────────────
+          # Titan WFO reads TITAN_BOT_TOKEN and TITAN_CHAT_ID from env.
+          # These are stored as bot_token.txt and chat_id.txt in the private
+          # repo (same pattern as all other custom bots), so they persist
+          # across restarts without needing GitHub secrets per bot.
+          # On first run: create these files manually in the private repo once.
+          export TITAN_BOT_TOKEN=$(cat "${WFO_DIR}/bot_token.txt" 2>/dev/null || echo "")
+          export TITAN_CHAT_ID=$(cat "${WFO_DIR}/chat_id.txt" 2>/dev/null || echo "")
+
+          # Also export under all common aliases so any component that reads
+          # a different env var name still gets the right value.
+          export BOT_TOKEN="$TITAN_BOT_TOKEN"
+          export TELEGRAM_BOT_TOKEN="$TITAN_BOT_TOKEN"
+          export TG_TOKEN="$TITAN_BOT_TOKEN"
+          export CHAT_ID="$TITAN_CHAT_ID"
+          export TELEGRAM_CHAT_ID="$TITAN_CHAT_ID"
+          export TG_CHAT_ID="$TITAN_CHAT_ID"
+
+          # ── Point WFO at the shared user_data directory ───────────────────
+          # config.py auto-detects environment. On GitHub Actions none of the
+          # hardcoded paths (_DOCKER_DIR, _HOST_DIR, _PHONE_DIR) exist, so it
+          # falls through to "local" mode using the directory containing the
+          # script itself as base. We override with TITAN_USER_DIR to point it
+          # at the shared freqtrade-core/user_data instead, so strategies,
+          # configs, hyperopts, and results are all in the shared location.
+          export TITAN_USER_DIR="$(pwd)/${USER_DATA}"
+
+          # Clear the lock file from any previous run — it lives in /tmp on
+          # GitHub runners which is ephemeral, but be explicit just in case.
+          rm -f /tmp/adb30_wfo_commander.lock
+
+          # ── Start WFO ─────────────────────────────────────────────────────
+          cd "${WFO_DIR}"
+          python3 main.py &
+          WFO_PID=$!
+          cd ../../../..   # back to private/
+
+          STOP_AFTER_SECONDS=$((5*3600 + 50*60))
+          END_TIME=$(( $(date +%s) + STOP_AFTER_SECONDS ))
+
+          while [ "$(date +%s)" -lt "$END_TIME" ]; do
+            sleep 300
+
+            if ! kill -0 "$WFO_PID" 2>/dev/null; then
+              echo "WFO process exited unexpectedly — stopping early."
+              break
+            fi
+
+            git pull --rebase -q || true
+
+            if [ -f "${WFO_DIR}/control.json" ] && grep -q '"restart_requested": *true' "${WFO_DIR}/control.json"; then
+              echo "Early restart requested by meta-bot — stopping."
+              break
+            fi
+
+            # Commit all WFO state and result files every 5 minutes.
+            # This includes: adb30_state.json, wfo_results/, hyperopt_results/,
+            # wfo_masters/, research/, phoenix_calibration.json.
+            # Strategies and hyperopts in user_data/strategies/ and
+            # user_data/hyperopts/ are also committed here so they're
+            # immediately available to live bots on their next restart.
+            git add \
+              "${USER_DATA}/adb30_state.json" \
+              "${USER_DATA}/wfo_results/" \
+              "${USER_DATA}/hyperopt_results/" \
+              "${USER_DATA}/wfo_masters/" \
+              "${USER_DATA}/research/" \
+              "${USER_DATA}/phoenix_calibration.json" \
+              "${USER_DATA}/strategies/" \
+              "${USER_DATA}/hyperopts/" \
+              "${USER_DATA}/configs/" \
+              "${WFO_DIR}/" \
+              2>/dev/null || true
+            git commit -m "autosave: wfo state - $(date -u)" -q || true
+            git push -q || true
+          done
+
+          # ── Graceful shutdown ─────────────────────────────────────────────
+          echo "Stopping WFO gracefully..."
+          kill -TERM "$WFO_PID" 2>/dev/null || true
+          wait "$WFO_PID" 2>/dev/null || true
+
+          # ── Final state commit ────────────────────────────────────────────
+          git pull --rebase -q || true
+
+          if [ -f "${WFO_DIR}/control.json" ]; then
+            PAUSED=$(grep -o '"paused": *true' "${WFO_DIR}/control.json" || echo "")
+          else
+            PAUSED=""
+          fi
+          if [ -n "$PAUSED" ]; then
+            echo '{"paused": true, "restart_requested": false}' > "${WFO_DIR}/control.json"
+          else
+            echo '{"paused": false, "restart_requested": false}' > "${WFO_DIR}/control.json"
+          fi
+
+          git add \
+            "${USER_DATA}/adb30_state.json" \
+            "${USER_DATA}/wfo_results/" \
+            "${USER_DATA}/hyperopt_results/" \
+            "${USER_DATA}/wfo_masters/" \
+            "${USER_DATA}/research/" \
+            "${USER_DATA}/phoenix_calibration.json" \
+            "${USER_DATA}/strategies/" \
+            "${USER_DATA}/hyperopts/" \
+            "${USER_DATA}/configs/" \
+            "${WFO_DIR}/" \
+            2>/dev/null || true
+          git commit -m "autosave: wfo final commit - $(date -u)" -q || true
+
+          PUSH_OK=false
+          for attempt in 1 2 3 4 5; do
+            if git push -q; then
+              PUSH_OK=true
+              break
+            fi
+            git pull --rebase -q || true
+            sleep $((attempt * 2))
+          done
+          if [ "$PUSH_OK" = false ]; then
+            echo "::error::Final WFO commit FAILED after 5 attempts — state may not have persisted!"
+          fi
+
+      # ── Persist OHLCV data as artifact ───────────────────────────────────
+      # Tar then upload. GitHub artifacts are always zipped by the action,
+      # so we tar first to avoid zip-of-zip issues with large directory trees.
+      - name: Upload OHLCV data artifact
+        if: always()
+        run: |
+          DATA_DIR="private/freqtrade-core/user_data/data"
+          if [ -d "$DATA_DIR" ] && [ "$(ls -A $DATA_DIR 2>/dev/null)" ]; then
+            echo "Tarballing OHLCV data ($(du -sh $DATA_DIR | cut -f1))..."
+            tar -czf /tmp/ohlcv_data.tar.gz -C "$DATA_DIR" .
+            echo "Tarball size: $(du -sh /tmp/ohlcv_data.tar.gz | cut -f1)"
+          else
+            echo "No OHLCV data to upload."
+            # Create empty tarball so the upload step always has a file
+            tar -czf /tmp/ohlcv_data.tar.gz -T /dev/null 2>/dev/null || touch /tmp/ohlcv_data.tar.gz
+          fi
+
+      - name: Save OHLCV artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wfo-ohlcv-data
+          path: /tmp/ohlcv_data.tar.gz
+          overwrite: true
+          retention-days: 90
+          if-no-files-found: ignore
+
+      # ── Schedule next run ─────────────────────────────────────────────────
+      # Same meta_restart check as live bots — meta-bot is sole restart
+      # authority when present; self-dispatch fires only as a fallback.
+      - name: Schedule next run
+        if: always()
+        run: |
+          cd private && git pull --rebase -q || true
+          WFO_DIR="freqtrade-core/user_data/custom_bots/wfo"
+
+          if [ -f "${WFO_DIR}/control.json" ] && grep -q '"paused": *true' "${WFO_DIR}/control.json"; then
+            echo "WFO is paused — not scheduling next run."
+            exit 0
+          fi
+
+          if [ -f "${WFO_DIR}/control.json" ] && grep -q '"meta_restart": *true' "${WFO_DIR}/control.json"; then
+            echo "Meta-bot is handling this restart — skipping self-dispatch."
+            exit 0
+          fi
+
+          echo "No meta-bot claim found — self-dispatching as fallback."
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/dispatches \
+            -d '{"event_type":"restart-custombot-wfo"}'
+          echo "Next WFO run triggered."
