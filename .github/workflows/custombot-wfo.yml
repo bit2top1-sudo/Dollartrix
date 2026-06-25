@@ -5,6 +5,11 @@ on:
   repository_dispatch:
     types: [restart-custombot-wfo]
 
+# Concurrency guard — only one WFO bot at a time.
+concurrency:
+  group: custombot-wfo
+  cancel-in-progress: true
+
 jobs:
   run-custom-bot:
     runs-on: ubuntu-latest
