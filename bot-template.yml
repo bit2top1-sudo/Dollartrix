@@ -5,6 +5,13 @@ on:
   repository_dispatch:
     types: [restart-bot-{{BOT_NAME}}]
 
+# Concurrency guard — only one run of this workflow at a time.
+# GitHub cancels the in-progress run before starting the new one,
+# preventing two Freqtrade instances from running simultaneously.
+concurrency:
+  group: bot-{{BOT_NAME}}
+  cancel-in-progress: true
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest

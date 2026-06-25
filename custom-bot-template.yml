@@ -5,6 +5,11 @@ on:
   repository_dispatch:
     types: [restart-custombot-{{BOT_NAME}}]
 
+# Concurrency guard — only one run of this workflow at a time.
+concurrency:
+  group: custombot-{{BOT_NAME}}
+  cancel-in-progress: true
+
 jobs:
   run-custom-bot:
     runs-on: ubuntu-latest
