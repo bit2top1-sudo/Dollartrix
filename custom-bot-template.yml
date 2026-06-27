@@ -36,6 +36,7 @@ jobs:
           AUTOMATE_CHAT_ID: ${{ secrets.AUTOMATE_CHAT_ID }}
           META_BOT_GITHUB_PAT: ${{ secrets.META_BOT_GITHUB_PAT }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          PUBLIC_REPO: ${{ github.event.repository.name }}
         run: |
           set -e
           cd private
