@@ -29,42 +29,22 @@ jobs:
         run: |
           git clone https://x-access-token:${{ secrets.FREQTRADE_CORE_PAT }}@github.com/${{ github.repository_owner }}/Miadol.git private
 
-      # ── Restore OHLCV data from artifact ─────────────────────────────────
-      # The data folder is ~700MB — too large for git. We persist it via
-      # artifact instead. On first ever run the artifact won't exist yet and
-      # WFO's auto-download will fetch whatever it needs during the run.
-      - name: Restore OHLCV data artifact
+      # ── Restore OHLCV data from Miadol repo ─────────────────────────────────
+      # Data now lives in Miadol repo's freqtrade-core/user_data/data/.
+      # VPS syncs to Miadol daily; workflows pull from there.
+      # No artifacts, no re-downloads from exchanges.
+      - name: Restore OHLCV data from Miadol repo
         run: |
           DATA_DIR="private/freqtrade-core/user_data/data"
           mkdir -p "$DATA_DIR"
-
-          ARTIFACT_NAME="wfo2-ohlcv-data"
-          RESPONSE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=${ARTIFACT_NAME}")
-          ARTIFACT_ID=$( (echo "$RESPONSE" | grep -o '"id":[0-9]*' || true) | head -1 | (grep -o '[0-9]*' || true) )
-
-          if [ -n "$ARTIFACT_ID" ]; then
-            echo "Found OHLCV artifact ID: $ARTIFACT_ID — downloading..."
-            HTTP_CODE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              -L -w "%{http_code}" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}/zip" \
-              -o /tmp/ohlcv_artifact.zip)
-            if [ "$HTTP_CODE" = "200" ] && [ -s /tmp/ohlcv_artifact.zip ]; then
-              # The artifact is a zip-of-a-zip: outer GitHub wrapper contains
-              # our inner ohlcv_data.tar.gz which we extract into data/.
-              unzip -o /tmp/ohlcv_artifact.zip -d /tmp/ohlcv_extracted || true
-              if [ -f /tmp/ohlcv_extracted/ohlcv_data.tar.gz ]; then
-                tar -xzf /tmp/ohlcv_extracted/ohlcv_data.tar.gz -C "$DATA_DIR"
-                echo "OHLCV data restored ($(du -sh $DATA_DIR | cut -f1))."
-              else
-                echo "::warning::Artifact downloaded but ohlcv_data.tar.gz not found inside."
-              fi
-            else
-              echo "::warning::OHLCV artifact download failed (HTTP $HTTP_CODE) — WFO will auto-download data as needed."
-            fi
-            rm -f /tmp/ohlcv_artifact.zip
+          
+          # Data is already in the Miadol repo from VPS sync
+          if [ -d "private/freqtrade-core/user_data/data" ] && \
+             [ "$(find private/freqtrade-core/user_data/data -type f 2>/dev/null | wc -l)" -gt 0 ]; then
+            DATA_SIZE=$(du -sh "$DATA_DIR" | cut -f1)
+            echo "✓ OHLCV data ready (${DATA_SIZE})"
           else
-            echo "No OHLCV artifact found — first run or artifact expired. WFO will download data as needed."
+            echo "⚠ No data in Miadol repo — WFO will auto-download as needed."
           fi
 
       # ── Install full stack (Freqtrade + hyperopt + WFO deps) ─────────────
@@ -233,33 +213,6 @@ jobs:
             echo "::error::Final WFO commit FAILED after 5 attempts — state may not have persisted!"
           fi
 
-      # ── Persist OHLCV data as artifact ───────────────────────────────────
-      # Tar then upload. GitHub artifacts are always zipped by the action,
-      # so we tar first to avoid zip-of-zip issues with large directory trees.
-      - name: Upload OHLCV data artifact
-        if: always()
-        run: |
-          DATA_DIR="private/freqtrade-core/user_data/data"
-          if [ -d "$DATA_DIR" ] && [ "$(ls -A $DATA_DIR 2>/dev/null)" ]; then
-            echo "Tarballing OHLCV data ($(du -sh $DATA_DIR | cut -f1))..."
-            tar -czf /tmp/ohlcv_data.tar.gz -C "$DATA_DIR" .
-            echo "Tarball size: $(du -sh /tmp/ohlcv_data.tar.gz | cut -f1)"
-          else
-            echo "No OHLCV data to upload."
-            # Create empty tarball so the upload step always has a file
-            tar -czf /tmp/ohlcv_data.tar.gz -T /dev/null 2>/dev/null || touch /tmp/ohlcv_data.tar.gz
-          fi
-
-      - name: Save OHLCV artifact
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: wfo2-ohlcv-data
-          path: /tmp/ohlcv_data.tar.gz
-          overwrite: true
-          retention-days: 90
-          if-no-files-found: ignore
-
       # ── Schedule next run ─────────────────────────────────────────────────
       # Same meta_restart check as live bots — meta-bot is sole restart
       # authority when present; self-dispatch fires only as a fallback.
@@ -267,7 +220,7 @@ jobs:
         if: always()
         run: |
           cd private && git pull --rebase -q || true
-          WFO_DIR="freqtrade-core/user_data/custom_bots/Wfo"
+          WFO_DIR="freqtrade-core/user_data/custom_bots/wfo2"
 
           if [ -f "${WFO_DIR}/control.json" ] && grep -q '"paused": *true' "${WFO_DIR}/control.json"; then
             echo "WFO is paused — not scheduling next run."
