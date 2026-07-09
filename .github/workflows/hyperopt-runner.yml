@@ -45,6 +45,8 @@ jobs:
       - name: Run hyperopt and export best params
         env:
           PAYLOAD: ${{ toJson(github.event.client_payload) }}
+          GH_DISPATCH_TOKEN: ${{ secrets.FREQTRADE_CORE_PAT }}
+          GH_REPO_FULL: ${{ github.repository }}
         run: |
           set -e
           cd private
@@ -303,6 +305,70 @@ jobs:
               with open(watchdog_config_path, "w") as f:
                   json.dump(wd_cfg, f)
               print(f"Set reload_config_requested=True in {watchdog_config_path} — watchdog will pick this up within ~2s.")
+
+          # --- Recycle chain: meta-bot's execute_recycle() attaches a
+          # "chain" instruction when it dispatches this run as part of a
+          # Recycle pipeline (Stop -> Hyperopt -> [here] Delete DB -> Restart
+          # -> [bot's own watchdog on wake] Block entries -> Reset HWM ->
+          # Confirm -> Unblock). This is the only point where meta-bot can
+          # hand off "what happens after hyperopt finishes" WITHOUT itself
+          # blocking for however many hours hyperopt takes — see
+          # execute_recycle's docstring in meta_bot.py for the full
+          # rationale. Only reached on a successful hyperopt run (failure
+          # exits early above via sys.exit(1)). ---
+          chain = payload.get("chain")
+          if chain and chain.get("action") == "recycle_continue":
+              print(f"Recycle chain: deleting DB and restarting {bot_name}...")
+              snapshot_path = f"{BOT_DIR}/tradesv3.sqlite.snapshot"
+              if os.path.exists(snapshot_path):
+                  os.remove(snapshot_path)
+                  print(f"Removed {snapshot_path}")
+              control_path = f"{BOT_DIR}/control.json"
+              with open(control_path, "w") as f:
+                  json.dump({"paused": False, "restart_requested": True}, f, indent=2)
+              watchdog_config_path = f"{BOT_DIR}/watchdog_config.json"
+              try:
+                  with open(watchdog_config_path) as f:
+                      wd_cfg = json.load(f)
+              except (FileNotFoundError, json.JSONDecodeError):
+                  wd_cfg = {}
+              wd_cfg["pending_unblock"] = {"kind": "recycle", "requested_at": time.time()}
+              with open(watchdog_config_path, "w") as f:
+                  json.dump(wd_cfg, f, indent=2)
+
+              subprocess.run(["git", "add", "-A"], check=False)
+              subprocess.run(["git", "commit", "-q", "-m",
+                               f"recycle: DB deleted, restart claimed - {bot_name}"], check=False)
+              _push_ok = False
+              for _attempt in range(5):
+                  if subprocess.run(["git", "push", "-q"]).returncode == 0:
+                      _push_ok = True
+                      break
+                  subprocess.run(["git", "pull", "--rebase", "-q"], check=False)
+                  time.sleep(_attempt * 2)
+              if not _push_ok:
+                  print("WARNING: recycle chain commit failed to push after 5 attempts.")
+
+              gh_token = os.environ.get("GH_DISPATCH_TOKEN", "")
+              repo_full = os.environ.get("GH_REPO_FULL", "")
+              if gh_token and repo_full:
+                  dispatch_req = urllib.request.Request(
+                      f"https://api.github.com/repos/{repo_full}/dispatches",
+                      data=json.dumps({"event_type": f"restart-bot-{bot_name}"}).encode(),
+                      headers={"Authorization": f"token {gh_token}",
+                               "Accept": "application/vnd.github.v3+json",
+                               "Content-Type": "application/json"},
+                      method="POST")
+                  try:
+                      urllib.request.urlopen(dispatch_req, timeout=20)
+                      print(f"Recycle chain: dispatched restart-bot-{bot_name}")
+                  except Exception as e:
+                      print(f"Recycle chain: restart dispatch failed: {e}")
+              else:
+                  print("Recycle chain: GH_DISPATCH_TOKEN/GH_REPO_FULL not set — cannot dispatch restart. "
+                        "Bot is stopped with a clean DB; restart it manually from BossBot.")
+              send_telegram(f"♻️ <b>{bot_name}</b> — Step 3/5: DB deleted, restarting now. "
+                            f"Watch for the entries-blocked/HWM-reset confirmation next.")
           PYEOF
 
           # Commit whatever changed — new params file, watchdog_config.json if
