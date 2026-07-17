@@ -96,7 +96,7 @@ jobs:
           git config user.email "wfo2@local"
           git config user.name "WFO2 Bot"
 
-          WFO_DIR="freqtrade-core/user_data/custom_bots/Wfo"
+          WFO_DIR="freqtrade-core/user_data/custom_bots/wfo"
           USER_DATA="freqtrade-core/user_data"
 
           # ── Verify WFO directory structure exists ──────────────────────────
