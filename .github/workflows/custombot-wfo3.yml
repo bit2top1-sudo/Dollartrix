@@ -76,7 +76,7 @@ jobs:
           git config user.email "wfo3@local"
           git config user.name "WFO3 Bot"
 
-          WFO_DIR="freqtrade-core/user_data/custom_bots/wfo"
+          WFO_DIR="freqtrade-core/user_data/custom_bots/Wfo"
           USER_DATA="freqtrade-core/user_data"
 
           # ── Verify WFO directory structure exists ──────────────────────────
@@ -220,7 +220,7 @@ jobs:
         if: always()
         run: |
           cd private && git pull --rebase -q || true
-          WFO_DIR="freqtrade-core/user_data/custom_bots/wfo3"
+          WFO_DIR="freqtrade-core/user_data/custom_bots/Wfo"
 
           if [ -f "${WFO_DIR}/control.json" ] && grep -q '"paused": *true' "${WFO_DIR}/control.json"; then
             echo "WFO is paused — not scheduling next run."
