@@ -25,7 +25,7 @@ jobs:
 
       - name: Install this bot's own dependencies
         run: |
-          cd private/freqtrade-core/user_data/custom_bots/Appmanager
+          cd private/freqtrade-core/user_data/custom_bots/app_manager
           pip install -r requirements.txt
 
       - name: Run bot for ~5h50m, commit its files every 5min, then handoff to next run
@@ -43,7 +43,7 @@ jobs:
           git config user.email "custombot@local"
           git config user.name "CustomBot ${BOT_NAME}"
 
-          BOT_DIR="freqtrade-core/user_data/custom_bots/${BOT_NAME}"
+          BOT_DIR="freqtrade-core/user_data/custom_bots/app_manager"
 
           # Token and chat_id live in the private repo, same as exchange keys
           # do for the Freqtrade bots — never a GitHub secret, since secrets
@@ -137,7 +137,7 @@ jobs:
         if: always()
         run: |
           cd private && git pull --rebase -q || true
-          BOT_DIR="freqtrade-core/user_data/custom_bots/Appmanager"
+          BOT_DIR="freqtrade-core/user_data/custom_bots/app_manager"
 
           if [ -f "${BOT_DIR}/control.json" ] && grep -q '"paused": *true' "${BOT_DIR}/control.json"; then
             echo "Appmanager is paused — not scheduling next run."
