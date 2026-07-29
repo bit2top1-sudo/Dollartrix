@@ -35,6 +35,7 @@ jobs:
           AUTOMATE_ENCRYPTION_KEY: ${{ secrets.AUTOMATE_ENCRYPTION_KEY }}
           AUTOMATE_CHAT_ID: ${{ secrets.AUTOMATE_CHAT_ID }}
           META_BOT_GITHUB_PAT: ${{ secrets.META_BOT_GITHUB_PAT }}
+          APP_MANAGER_PRIVATE_KEY_PEM: ${{ secrets.APP_MANAGER_PRIVATE_KEY_PEM }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
           set -e
