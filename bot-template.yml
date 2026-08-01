@@ -3,13 +3,17 @@ name: LiveBot - {{BOT_NAME}}
 on:
   workflow_dispatch:
   repository_dispatch:
-    types: [restart-bot-{{BOT_NAME}}]
+    types: [restart-bot-{{BOT_NAME}}, prime-bot-{{BOT_NAME}}]
 
-# Concurrency guard — only one run of this workflow at a time.
-# GitHub cancels the in-progress run before starting the new one,
-# preventing two Freqtrade instances from running simultaneously.
+# Concurrency guard, split the same way meta-bot.yml / custom-bot-template.yml
+# are split: a primer dispatched to warm up this bot's successor MUST run in
+# a separate group from the currently-live process, or GitHub's
+# cancel-in-progress would kill the still-live process (with real open
+# positions on an exchange) the instant the primer job starts — not once
+# it's actually ready to take over. Routing around that platform behavior
+# is the entire reason this isn't just "dispatch a second run and hope."
 concurrency:
-  group: bot-{{BOT_NAME}}
+  group: ${{ github.event.action == 'prime-bot-{{BOT_NAME}}' && 'bot-{{BOT_NAME}}-primer' || 'bot-{{BOT_NAME}}' }}
   cancel-in-progress: true
 
 jobs:
@@ -107,6 +111,9 @@ jobs:
           META_BOT_TOKEN: ${{ secrets.META_BOT_TOKEN }}
           META_BOT_GITHUB_PAT: ${{ secrets.META_BOT_GITHUB_PAT }}
           OWNER_CHAT_ID: ${{ secrets.OWNER_CHAT_ID }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          PUBLIC_REPO: ${{ github.event.repository.name }}
+          HANDOFF_MODE: ${{ github.event.action == 'prime-bot-{{BOT_NAME}}' && 'primer' || 'normal' }}
         run: |
           set -e
           cd private
@@ -124,8 +131,132 @@ jobs:
           BOT_DIR="${USER_DATA}/live_bots/${BOT_NAME}"
           DB_FILE="${BOT_DIR}/tradesv3.sqlite"
           SECRETS_CONFIG="${BOT_DIR}/secrets.json"
+          HANDOFF_FILE_PATH="${USER_DATA}/handoff/${BOT_NAME}.json"
 
           mkdir -p "$BOT_DIR"
+
+          THIS_INSTANCE_ID="$(python3 -c 'import uuid; print(uuid.uuid4().hex[:12])')"
+          echo "This instance: ${THIS_INSTANCE_ID} (mode: ${HANDOFF_MODE})"
+
+          # --- Handoff file helpers (identical pattern to custom-bot-template.yml
+          # — see that file's comments for the full rationale on why this uses
+          # the GitHub Contents API directly rather than the local git clone:
+          # a fast-cadence signal file deserves its own transport, separate
+          # from the DB's own periodic commit-and-push loop below.) ---
+          gh_get_handoff() {
+            curl -s -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/Miadol/contents/${HANDOFF_FILE_PATH}"
+          }
+
+          gh_put_handoff() {
+            local content_b64="$1"
+            local message="$2"
+            for attempt in 1 2 3; do
+              sha=$(gh_get_handoff | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("sha","") if isinstance(d,dict) else "")' 2>/dev/null || echo "")
+              if [ -n "$sha" ]; then
+                body=$(python3 -c "import json,sys; print(json.dumps({'message': sys.argv[1], 'content': sys.argv[2], 'sha': sys.argv[3]}))" "$message" "$content_b64" "$sha")
+              else
+                body=$(python3 -c "import json,sys; print(json.dumps({'message': sys.argv[1], 'content': sys.argv[2]}))" "$message" "$content_b64")
+              fi
+              http_code=$(curl -s -o /tmp/gh_put_resp.json -w "%{http_code}" \
+                -X PUT -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/Miadol/contents/${HANDOFF_FILE_PATH}" \
+                -d "$body")
+              if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
+                return 0
+              fi
+              sleep $((attempt * 2))
+            done
+            echo "::warning::gh_put_handoff failed after 3 attempts (http=$http_code) — handoff will fall back to normal budget-exhaustion restart."
+            return 1
+          }
+
+          read_handoff_field() {
+            gh_get_handoff | python3 -c "import sys,json,base64; d=json.load(sys.stdin); h=json.loads(base64.b64decode(d['content']).decode()); print(h.get('$1','') or '')" 2>/dev/null || echo ""
+          }
+
+          # ==================================================================
+          # PRIMER MODE. Freqtrade research note (confirmed against official
+          # docs before building this): open TRADES are stored in the DB and
+          # are found/resumed automatically on every startup — this is
+          # ordinary, unconditional Freqtrade behavior, not something this
+          # workflow has to engineer. The one real caveat: open ORDERS
+          # (not-yet-filled) are kept open on restart on the assumption they
+          # weren't filled while offline — an assumption that's safe BECAUSE
+          # the gap is short, not safe regardless of gap length. So the only
+          # thing this handoff needs to get right for Freqtrade specifically
+          # is minimizing that gap — no special "safe-pause" API call needed,
+          # no waiting for zero in-flight orders. Warm the whole process
+          # (venv already installed via the earlier step, DB restored,
+          # Freqtrade fully started) and only kill the outgoing process once
+          # the successor is already confirmed alive.
+          # ==================================================================
+          if [ "$HANDOFF_MODE" = "primer" ]; then
+            existing_primer_id=$(read_handoff_field primer_instance_id)
+            existing_phase=$(read_handoff_field phase)
+            if [ -n "$existing_primer_id" ] && [ "$existing_primer_id" != "$THIS_INSTANCE_ID" ] && [ "$existing_phase" != "idle" ] && [ -n "$existing_phase" ]; then
+              echo "Handoff slot already claimed by ${existing_primer_id} (phase=${existing_phase}) — this primer is stale, exiting without serving."
+              exit 0
+            fi
+
+            # Re-pull now (this is in ADDITION to the "Restore previous bot
+            # database" step earlier — that step ran once, right after clone,
+            # potentially many minutes before this point; the outgoing
+            # process has kept committing a fresh DB snapshot every 5 min
+            # the whole time this primer has been sitting here warm). This
+            # re-pull+re-restore is the one Freqtrade-specific step beyond
+            # the generic custom-bot handoff pattern — the DB must be as
+            # fresh as possible at the ACTUAL moment of takeover, not at
+            # whatever moment priming happened to start.
+            git pull --rebase -q || true
+            if [ -s "${DB_FILE}.snapshot" ]; then
+              cp "${DB_FILE}.snapshot" "$DB_FILE"
+              echo "Re-restored DB from latest git snapshot immediately before announcing ready."
+            fi
+
+            write_handoff_json() {
+              local b64
+              b64=$(printf '%s' "$1" | base64 -w0)
+              gh_put_handoff "$b64" "handoff: ${BOT_NAME} update"
+            }
+            write_handoff_json "{\"phase\": \"ready\", \"primer_instance_id\": \"${THIS_INSTANCE_ID}\", \"go_ts\": null}"
+            echo "Primer ready (${THIS_INSTANCE_ID}) — waiting for go signal..."
+
+            DEADLINE=$(( $(date +%s) + 20*60 ))
+            GOT_GO="false"
+            while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+              sleep 5
+              cur_phase=$(read_handoff_field phase)
+              cur_primer=$(read_handoff_field primer_instance_id)
+              if [ "$cur_phase" = "go_sent" ] && [ "$cur_primer" = "$THIS_INSTANCE_ID" ]; then
+                echo "Go signal confirmed for ${THIS_INSTANCE_ID} — taking over."
+                GOT_GO="true"
+                write_handoff_json "{\"phase\": \"idle\", \"primer_instance_id\": null, \"go_ts\": null}"
+                # One LAST re-pull+re-restore right at the moment of takeover
+                # — the outgoing process's final pre-shutdown commit (see the
+                # "outgoing side" yield block below) lands right around now,
+                # and this is the last chance to pick it up before Freqtrade
+                # actually opens the DB file for real.
+                git pull --rebase -q || true
+                if [ -s "${DB_FILE}.snapshot" ]; then
+                  cp "${DB_FILE}.snapshot" "$DB_FILE"
+                fi
+                break
+              fi
+              if [ "$cur_phase" = "idle" ]; then
+                echo "Handoff slot was reset by the outgoing process — abandoning."
+                exit 0
+              fi
+            done
+
+            if [ "$GOT_GO" != "true" ]; then
+              echo "No go signal within timeout — giving up. Outgoing process's own budget-exhaustion fallback covers continuity."
+              exit 0
+            fi
+            # Falls through into normal serving below, AS the new instance.
+          fi
 
           # Freqtrade merges multiple --config files left-to-right, later
           # ones overriding earlier ones — so the shared base config supplies
@@ -160,7 +291,10 @@ jobs:
           # GitHub will hard-kill the whole job at 360min regardless of what's
           # mid-flight, so this margin is what keeps that from ever happening.
           STOP_AFTER_SECONDS=$((5*3600 + 50*60))
+          HANDOFF_MARGIN_SECONDS=$((15*60))
           END_TIME=$(( $(date +%s) + STOP_AFTER_SECONDS ))
+          PRIMER_DISPATCHED="false"
+          EXIT_SENTINEL="normal"
 
           # Local signal file — written by this shell loop after each git pull,
           # read by the watchdog directly off disk. Avoids the GitHub round-trip
@@ -207,6 +341,47 @@ jobs:
             git add "${DB_FILE}.snapshot"
             git commit -m "autosave: periodic snapshot - ${BOT_NAME} - $(date -u)" -q || true
             git push -q || true
+
+            # --- Handoff: outgoing side, checked once per 5-min cycle -----
+            _time_left=$(( END_TIME - $(date +%s) ))
+            if [ "$PRIMER_DISPATCHED" = "false" ] && [ "$_time_left" -le "$HANDOFF_MARGIN_SECONDS" ]; then
+              PRIMER_DISPATCHED="true"
+              cur_phase=$(read_handoff_field phase)
+              if [ -z "$cur_phase" ] || [ "$cur_phase" = "idle" ]; then
+                b64=$(printf '%s' "{\"phase\": \"priming\", \"primer_instance_id\": null, \"go_ts\": null}" | base64 -w0)
+                gh_put_handoff "$b64" "handoff: ${BOT_NAME} priming"
+                curl -s -X POST \
+                  -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+                  -H "Accept: application/vnd.github.v3+json" \
+                  "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PUBLIC_REPO}/dispatches" \
+                  -d "{\"event_type\":\"prime-bot-${BOT_NAME}\"}"
+                echo "Primer dispatched for ${BOT_NAME}."
+              fi
+            fi
+
+            if [ "$PRIMER_DISPATCHED" = "true" ]; then
+              cur_phase=$(read_handoff_field phase)
+              cur_primer=$(read_handoff_field primer_instance_id)
+              if [ "$cur_phase" = "ready" ] && [ -n "$cur_primer" ]; then
+                echo "Primer ${cur_primer} is ready — writing one final DB snapshot, then yielding immediately."
+                # Final snapshot commit right before yielding, so the primer's
+                # very last re-pull (in its own go-confirmed branch above)
+                # picks up the absolute freshest DB state — this is the
+                # single highest-value commit in the entire handoff sequence
+                # for a Freqtrade bot specifically, since it's what bounds
+                # how stale the successor's picture of open trades/orders
+                # can possibly be.
+                sqlite3 "$DB_FILE" ".backup '${DB_FILE}.snapshot'" 2>/dev/null || true
+                git add "${DB_FILE}.snapshot"
+                git commit -m "autosave: final pre-handoff snapshot - ${BOT_NAME} - $(date -u)" -q || true
+                git push -q || true
+
+                b64=$(printf '%s' "{\"phase\": \"go_sent\", \"primer_instance_id\": \"${cur_primer}\", \"go_ts\": true}" | base64 -w0)
+                gh_put_handoff "$b64" "handoff: ${BOT_NAME} go"
+                EXIT_SENTINEL="handoff_yielded"
+                break
+              fi
+            fi
           done
 
           echo "Stopping ${BOT_NAME} gracefully..."
@@ -239,6 +414,8 @@ jobs:
           git commit -m "autosave: control state for ${BOT_NAME} - $(date -u)" -q || true
           git push -q || true
 
+          echo "$EXIT_SENTINEL" > /tmp/livebot_exit_reason_${BOT_NAME}
+
       # Upload the live database as an artifact for the next run to download
       # This avoids Git merge conflicts on binary files and ensures seamless persistence
       - name: Upload database artifact
@@ -256,11 +433,25 @@ jobs:
       # this run, so by the time this step executes (after cancellation or natural
       # exit) we can tell whether meta-bot is handling the restart or we should
       # self-dispatch as a fallback (e.g. if meta-bot is itself down).
-      - name: Schedule next run
+      - name: Schedule next run (skipped on clean handoff — successor already live under a separate concurrency group)
         if: always()
         run: |
           cd private && git pull --rebase -q || true
           BOT_DIR="freqtrade-core/user_data/live_bots/{{BOT_NAME}}"
+
+          # Clean handoff: the successor is already live under the
+          # "bot-{{BOT_NAME}}-primer" group, NOT this workflow's normal
+          # group — dispatching restart-bot-{{BOT_NAME}} here would start a
+          # genuine competing THIRD Freqtrade instance against the same
+          # exchange account, not get cancelled as a harmless duplicate the
+          # way a same-group dispatch always did pre-handoff. This is the
+          # single highest-stakes check in this whole file — a live bot
+          # duplicated against a real exchange account is a real-money risk,
+          # not just a wasted CI run.
+          if [ -f "/tmp/livebot_exit_reason_{{BOT_NAME}}" ] && grep -q "handoff_yielded" "/tmp/livebot_exit_reason_{{BOT_NAME}}"; then
+            echo "Clean handoff detected — successor is already live under the '-primer' concurrency group. Skipping self-dispatch entirely."
+            exit 0
+          fi
 
           # Never restart a paused bot — that requires explicit Resume from meta-bot.
           if [ -f "${BOT_DIR}/control.json" ] && grep -q '"paused": *true' "${BOT_DIR}/control.json"; then
