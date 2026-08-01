@@ -3,11 +3,27 @@ name: Meta-Bot
 on:
   workflow_dispatch:
   repository_dispatch:
-    types: [restart-meta-bot]
+    types: [restart-meta-bot, prime-meta-bot]
 
-# Concurrency guard — only one meta-bot at a time.
+# Concurrency guard. Split into two groups so a primer run (dispatched by
+# the currently-live process to warm up its own successor) is NEVER
+# cancelled by GitHub the instant it starts, which is what a shared group
+# would do (cancel-in-progress fires on job START, not on the primer
+# reaching readiness — this is the one platform fact the whole
+# zero-downtime handoff design has to route around).
+#
+# - "restart-meta-bot" (normal path: crash-restart, budget exhaustion,
+#   manual /restart_meta, fallback) always runs in group "meta-bot" and
+#   is subject to the normal cancel-in-progress behavior, same as before.
+# - "prime-meta-bot" (handoff path only) runs in group "meta-bot-primer",
+#   a DIFFERENT group, so it can start up and fully warm up concurrently
+#   with the still-live outgoing "meta-bot" group run without either one
+#   cancelling the other. Once the primer is confirmed ready and the
+#   handoff completes inside meta_bot.py, the primer process re-enters
+#   the "meta-bot" identity for the NEXT cycle's purposes — see the
+#   handoff notes in meta_bot.py's main() for the full state machine.
 concurrency:
-  group: meta-bot
+  group: ${{ github.event.action == 'prime-meta-bot' && 'meta-bot-primer' || 'meta-bot' }}
   cancel-in-progress: true
 
 jobs:
@@ -33,25 +49,49 @@ jobs:
           OWNER_CHAT_ID: ${{ secrets.OWNER_CHAT_ID }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
           PUBLIC_REPO: ${{ github.event.repository.name }}
+          META_BOT_HANDOFF_MODE: ${{ github.event.action == 'prime-meta-bot' && 'primer' || 'normal' }}
+          META_BOT_EXIT_SENTINEL: /tmp/meta_bot_exit_reason
         run: python3 private/meta_bot.py
         # meta_bot.py fires the restart dispatch itself before exiting (v41 fix).
-        # The step below is a pure safety net in case that dispatch failed.
+        # The step below is a pure safety net in case that dispatch failed —
+        # EXCEPT on a clean handoff exit, which must NOT trigger it (see
+        # that step's own comment for why a plain "harmless duplicate"
+        # assumption no longer holds once primer/outgoing run in separate
+        # concurrency groups). meta_bot.py writes a one-line sentinel file
+        # to $META_BOT_EXIT_SENTINEL right before returning/exiting on
+        # every path (handoff-yielded, normal budget exhaustion, primer
+        # gave up) so the next step can tell them apart without parsing
+        # logs. In primer mode, meta_bot.py never reaches a real exit
+        # under normal handoff conditions — it transitions in-process
+        # into the serving loop after a confirmed handoff and this whole
+        # job just keeps running under its new role; the sentinel/safety
+        # net below is only ever relevant on an actual process exit.
 
-      - name: Safety-net fallback restart (30s wait then re-dispatch)
+      - name: Safety-net fallback restart (30s wait then re-dispatch, skipped on clean handoff)
         if: always()
         env:
           PUBLIC_REPO: ${{ github.event.repository.name }}
         run: |
           # meta_bot.py already fired the restart dispatch synchronously before
-          # exiting — so in the normal case this curl is a harmless duplicate
-          # (the concurrency guard cancels any second trigger).
-          # This step exists ONLY to cover the edge case where meta_bot.py
-          # crashed before reaching its own dispatch call.
+          # exiting on the normal (non-handoff) path — so in that case this
+          # curl would just be a harmless duplicate (the concurrency guard
+          # cancels the redundant trigger). This step exists to cover the
+          # edge case where meta_bot.py crashed before reaching its own
+          # dispatch call.
           #
-          # We sleep only 30s (well within the 6h job cap) so this step can
-          # never push the job over the limit and cause the old "exceeded
-          # maximum execution time of 6h0m0s" kill that previously prevented
-          # the restart from firing at all.
+          # On a CLEAN HANDOFF exit specifically, this must be skipped
+          # outright rather than treated as a harmless duplicate: the
+          # successor primer is running under the SEPARATE
+          # "meta-bot-primer" concurrency group, not "meta-bot", so a
+          # restart-meta-bot dispatch here would land in the now-empty
+          # "meta-bot" group and actually start a genuine THIRD process
+          # racing the successor — not get cancelled as a duplicate the
+          # way it always did pre-handoff.
+          if [ -f /tmp/meta_bot_exit_reason ] && grep -q "handoff_yielded" /tmp/meta_bot_exit_reason; then
+            echo "Clean handoff detected (sentinel=handoff_yielded) — successor is already live under a separate concurrency group. Skipping safety-net restart."
+            exit 0
+          fi
+
           sleep 30
           curl -s -X POST \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \

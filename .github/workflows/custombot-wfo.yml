@@ -99,6 +99,118 @@ jobs:
           WFO_DIR="freqtrade-core/user_data/custom_bots/Wfo"
           USER_DATA="freqtrade-core/user_data"
 
+          # ── Sync-and-commit helper (FIX: replaces silently-swallowed
+          # `git pull --rebase -q || true` / `git push -q || true`) ─────────
+          # Previously, the mid-loop commit every 5 minutes could fail
+          # SILENTLY at either the pre-commit pull-rebase step or the
+          # post-commit push step (both piped to `|| true`, discarding the
+          # actual error). Under any real git contention on the private
+          # repo — plausible any time meta-bot, another custom bot, or this
+          # bot's own previous run is also writing to it — this meant a
+          # whole 5-minute interval's worth of WFO progress could commit
+          # only to this runner's LOCAL clone and never actually reach
+          # GitHub, with no error visible anywhere. The next restart clones
+          # fresh from origin/main and never sees that work: from Mia's
+          # side, this looked exactly like "WFO doesn't keep its state
+          # across restarts," even though state.py's own load/save logic
+          # was fine the whole time — the bug was here, in the transport
+          # loop wrapping it.
+          #
+          # This function: stages the same paths as before, retries
+          # pull-rebase + commit + push as a unit up to 5 times with a
+          # short backoff, and — critically — LOGS LOUDLY (::error::, so it
+          # shows up flagged in the Actions run summary, not buried in
+          # scrolling output) if all retries are exhausted, instead of
+          # continuing on in total silence. It never hard-resets or
+          # discards a local commit — if a push genuinely can't succeed
+          # after 5 tries, the local commit is left in place (so nothing
+          # already-committed is lost) and the loop continues; the NEXT
+          # 5-minute cycle's pull-rebase will attempt to reconcile it, and
+          # the final end-of-run commit is a last remaining safety net.
+          sync_and_commit_wfo_state() {
+            local commit_msg="$1"
+            local attempt
+            local _p
+
+            # Stage each path as its OWN git add call, never one call with
+            # many pathspecs at once. `git add p1 p2 p3 ...` is atomic — if
+            # even ONE pathspec matches nothing (e.g. wfo_results/ doesn't
+            # exist yet on a brand-new bot that hasn't produced any results
+            # yet), the ENTIRE call fails and stages NOTHING AT ALL,
+            # including adb30_state.json, which very much does exist and
+            # very much has real changes worth saving. The old
+            # `2>/dev/null || true` wrapping around the batched call masked
+            # exactly this failure — confirmed via an isolated sandbox
+            # repro before writing this version.
+            for _p in \
+              "${USER_DATA}/adb30_state.json" \
+              "${USER_DATA}/wfo_results/" \
+              "${USER_DATA}/hyperopt_results/" \
+              "${USER_DATA}/wfo_masters/" \
+              "${USER_DATA}/research/" \
+              "${USER_DATA}/phoenix_calibration.json" \
+              "${USER_DATA}/strategies/" \
+              "${USER_DATA}/hyperopts/" \
+              "${USER_DATA}/configs/" \
+              "${WFO_DIR}/"
+            do
+              git add "$_p" 2>/dev/null || true
+            done
+
+            if git diff --cached --quiet; then
+              # Nothing changed since last sync — not an error, just
+              # nothing to push this cycle.
+              return 0
+            fi
+
+            # Commit local changes BEFORE pulling — not after. WFO writes
+            # adb30_state.json directly to disk every cycle without ever
+            # staging or committing it itself, so by the time this
+            # function runs the working tree already has unstaged
+            # modifications to a TRACKED file. `git pull --rebase`
+            # unconditionally refuses to run at all against unstaged
+            # changes to a tracked file, regardless of whether there's an
+            # actual upstream conflict — pulling before committing would
+            # therefore fail EVERY single cycle, not just on real
+            # contention. Committing first, then pulling --rebase (which
+            # cleanly replays this commit on top of whatever was just
+            # fetched), is the order that actually works — also confirmed
+            # via the same sandbox repro, including the realistic
+            # non-colliding concurrent-write case succeeding end to end.
+            git commit -m "${commit_msg}" -q || true
+
+            for attempt in 1 2 3 4 5; do
+              if ! git pull --rebase -q; then
+                echo "::warning::WFO state sync: git pull --rebase failed (attempt ${attempt}/5) — retrying."
+                git rebase --abort >/dev/null 2>&1 || true
+                sleep $((attempt * 3))
+                continue
+              fi
+
+              if git push -q; then
+                return 0
+              fi
+
+              echo "::warning::WFO state sync: git push failed (attempt ${attempt}/5) — will re-pull and retry."
+              sleep $((attempt * 3))
+            done
+
+            # A genuine, unresolvable content conflict (two runs modifying
+            # the SAME field of adb30_state.json in the same window) will
+            # legitimately exhaust all 5 retries — no amount of retrying
+            # fixes something git's line-based merge cannot resolve on its
+            # own. This is the correct, honest failure mode: the commit
+            # stays LOCAL (never discarded, never silently overwritten by
+            # a force-push or hard-reset) and loudly flagged, rather than
+            # either silently losing this run's work or silently
+            # corrupting the shared state file. If this fires repeatedly
+            # rather than as a one-off, it's worth checking whether two
+            # things are genuinely racing on this exact bot's state file.
+            echo "::error::WFO state sync FAILED after 5 attempts (${commit_msg}) — state is committed LOCALLY on this runner but has NOT reached GitHub. It will be retried next cycle; if this keeps happening, check for a genuine conflict (e.g. two workflows racing on the private repo) rather than a transient blip."
+            return 1
+          }
+
+
           # ── Verify WFO directory structure exists ──────────────────────────
           if [ ! -f "${WFO_DIR}/main.py" ]; then
             echo "❌ ERROR: WFO main.py not found at ${WFO_DIR}/main.py"
@@ -157,33 +269,29 @@ jobs:
               break
             fi
 
-            git pull --rebase -q || true
+            # FIX: was `git pull --rebase -q || true` — a silent failure
+            # here meant the control.json check right below could be
+            # reading STALE local state (missing a restart request meta-bot
+            # already pushed), with zero indication anything was wrong.
+            if ! git pull --rebase -q; then
+              echo "::warning::WFO: pre-check git pull --rebase failed — control.json read this cycle may be stale. Will retry via the sync function below regardless."
+              git rebase --abort >/dev/null 2>&1 || true
+            fi
 
             if [ -f "${WFO_DIR}/control.json" ] && grep -q '"restart_requested": *true' "${WFO_DIR}/control.json"; then
               echo "Early restart requested by meta-bot — stopping."
               break
             fi
 
-            # Commit all WFO state and result files every 5 minutes.
+            # Commit all WFO state and result files every 5 minutes, via
+            # the retry-hardened helper defined above (see its own comment
+            # for why this replaced the old silent add/commit/push).
             # This includes: adb30_state.json, wfo_results/, hyperopt_results/,
             # wfo_masters/, research/, phoenix_calibration.json.
             # Strategies and hyperopts in user_data/strategies/ and
             # user_data/hyperopts/ are also committed here so they're
             # immediately available to live bots on their next restart.
-            git add \
-              "${USER_DATA}/adb30_state.json" \
-              "${USER_DATA}/wfo_results/" \
-              "${USER_DATA}/hyperopt_results/" \
-              "${USER_DATA}/wfo_masters/" \
-              "${USER_DATA}/research/" \
-              "${USER_DATA}/phoenix_calibration.json" \
-              "${USER_DATA}/strategies/" \
-              "${USER_DATA}/hyperopts/" \
-              "${USER_DATA}/configs/" \
-              "${WFO_DIR}/" \
-              2>/dev/null || true
-            git commit -m "autosave: wfo state - $(date -u)" -q || true
-            git push -q || true
+            sync_and_commit_wfo_state "autosave: wfo state - $(date -u)" || true
           done
 
           # ── Graceful shutdown ─────────────────────────────────────────────
@@ -192,8 +300,6 @@ jobs:
           wait "$WFO_PID" 2>/dev/null || true
 
           # ── Final state commit ────────────────────────────────────────────
-          git pull --rebase -q || true
-
           if [ -f "${WFO_DIR}/control.json" ]; then
             PAUSED=$(grep -o '"paused": *true' "${WFO_DIR}/control.json" || echo "")
           else
@@ -205,30 +311,14 @@ jobs:
             echo '{"paused": false, "restart_requested": false}' > "${WFO_DIR}/control.json"
           fi
 
-          git add \
-            "${USER_DATA}/adb30_state.json" \
-            "${USER_DATA}/wfo_results/" \
-            "${USER_DATA}/hyperopt_results/" \
-            "${USER_DATA}/wfo_masters/" \
-            "${USER_DATA}/research/" \
-            "${USER_DATA}/phoenix_calibration.json" \
-            "${USER_DATA}/strategies/" \
-            "${USER_DATA}/hyperopts/" \
-            "${USER_DATA}/configs/" \
-            "${WFO_DIR}/" \
-            2>/dev/null || true
-          git commit -m "autosave: wfo final commit - $(date -u)" -q || true
-
-          PUSH_OK=false
-          for attempt in 1 2 3 4 5; do
-            if git push -q; then
-              PUSH_OK=true
-              break
-            fi
-            git pull --rebase -q || true
-            sleep $((attempt * 2))
-          done
-          if [ "$PUSH_OK" = false ]; then
+          # Reuses the same hardened sync function as the mid-loop commits
+          # above — this replaces what used to be a separate, slightly
+          # weaker retry loop here (no rebase-abort recovery on a failed
+          # pull, no check for "nothing actually changed"). Consistency
+          # between the mid-loop and final commit paths matters: this is
+          # the very last chance to get this run's work back to GitHub
+          # before the runner's filesystem is discarded.
+          if ! sync_and_commit_wfo_state "autosave: wfo final commit - $(date -u)"; then
             echo "::error::Final WFO commit FAILED after 5 attempts — state may not have persisted!"
           fi
 
@@ -265,7 +355,11 @@ jobs:
       - name: Schedule next run
         if: always()
         run: |
-          cd private && git pull --rebase -q || true
+          cd private
+          if ! git pull --rebase -q; then
+            echo "::warning::Schedule-next-run: git pull --rebase failed — control.json read below may be stale."
+            git rebase --abort >/dev/null 2>&1 || true
+          fi
           WFO_DIR="freqtrade-core/user_data/custom_bots/Wfo"
 
           if [ -f "${WFO_DIR}/control.json" ] && grep -q '"paused": *true' "${WFO_DIR}/control.json"; then
