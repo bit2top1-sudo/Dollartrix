@@ -3,282 +3,313 @@ name: CustomBot - wfo3
 on:
   workflow_dispatch:
   repository_dispatch:
-    types: [restart-custombot-wfo3]
+    types: [restart-custombot-wfo3, prime-custombot-wfo3]
 
-# Concurrency guard — only one WFO bot at a time.
+# Concurrency guard, split the same way meta-bot.yml is split, for the
+# same reason: a primer dispatched to warm up this bot's successor must
+# run in a SEPARATE group from the currently-live process, or GitHub's
+# cancel-in-progress would kill the still-live process the instant the
+# primer job starts (not once the primer is ready) — that single platform
+# fact is why this can't just be "dispatch a second run into the same
+# group and hope the timing works out."
 concurrency:
-  group: custombot-wfo3
+  group: ${{ github.event.action == 'prime-custombot-wfo3' && 'custombot-wfo3-primer' || 'custombot-wfo3' }}
   cancel-in-progress: true
 
 jobs:
   run-custom-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 360          # GitHub's hard cap for a single job — cannot be raised
     permissions:
       contents: write
       actions: write
 
     steps:
-      - name: Checkout public scaffold
-        uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          path: public
-
       - name: Clone private repo (Miadol)
         run: |
           git clone https://x-access-token:${{ secrets.FREQTRADE_CORE_PAT }}@github.com/${{ github.repository_owner }}/Miadol.git private
 
-      # ── Self-heal: fill in any files missing from this bot's own folder ──
-      # Same fix and rationale as custombot-wfo2.yml — see that file's
-      # comment for the full incident writeup. wfo3 hit the identical
-      # crash-loop from the same pre-fix clone bug.
-      - name: Self-heal missing bot files from wfo template
+      - name: Install this bot's own dependencies
         run: |
-          set -e
-          SRC="private/freqtrade-core/user_data/custom_bots/wfo"
-          DEST="private/freqtrade-core/user_data/custom_bots/wfo3"
-          if [ ! -d "$SRC" ]; then
-            echo "::warning::Source 'wfo' template folder not found — cannot self-heal. Skipping."
-          else
-            mkdir -p "$DEST"
-            HEALED=""
-            for f in "$SRC"/*.py "$SRC/requirements.txt"; do
-              [ -e "$f" ] || continue
-              base="$(basename "$f")"
-              if [ ! -f "$DEST/$base" ]; then
-                cp "$f" "$DEST/$base"
-                HEALED="${HEALED}${base}, "
-              fi
-            done
-            if [ -n "$HEALED" ]; then
-              echo "::warning::Self-healed missing file(s) into wfo3 from 'wfo' template: ${HEALED%, }. This bot's folder was incomplete — consider recreating it cleanly via BossBot when convenient."
-            else
-              echo "wfo3's folder already has every file 'wfo' has — nothing to heal."
-            fi
-          fi
+          cd private/freqtrade-core/user_data/custom_bots/wfo3
+          pip install -r requirements.txt
 
-      # ── Restore OHLCV data from Miadol repo ─────────────────────────────────
-      # Data now lives in Miadol repo's freqtrade-core/user_data/data/.
-      # VPS syncs to Miadol daily; workflows pull from there.
-      # No artifacts, no re-downloads from exchanges.
-      - name: Restore OHLCV data from Miadol repo
-        run: |
-          DATA_DIR="private/freqtrade-core/user_data/data"
-          mkdir -p "$DATA_DIR"
-          
-          # Data is already in the Miadol repo from VPS sync
-          if [ -d "private/freqtrade-core/user_data/data" ] && \
-             [ "$(find private/freqtrade-core/user_data/data -type f 2>/dev/null | wc -l)" -gt 0 ]; then
-            DATA_SIZE=$(du -sh "$DATA_DIR" | cut -f1)
-            echo "✓ OHLCV data ready (${DATA_SIZE})"
-          else
-            echo "⚠ No data in Miadol repo — WFO will auto-download as needed."
-          fi
-
-      # ── Install full stack (Freqtrade + hyperopt + WFO deps) ─────────────
-      # WFO calls freqtrade as a subprocess so it needs the full stack.
-      # WFO's own Python deps (aiohttp, python-dotenv, numpy) are included
-      # here directly — no separate requirements.txt step needed.
-      - name: Install Freqtrade + hyperopt deps
-        run: |
-          pip install "freqtrade[hyperopt]" scipy numba bottleneck scikit-learn statsmodels \
-            aiohttp python-dotenv numpy
-          # TA-Lib: try prebuilt wheel first; fall back to building from source.
-          pip install ta-lib 2>/dev/null || (
-            sudo apt-get install -y build-essential wget &&
-            wget -q http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz &&
-            tar -xzf ta-lib-0.4.0-src.tar.gz &&
-            cd ta-lib && ./configure --prefix=/usr && make -j2 && sudo make install && cd .. &&
-            pip install ta-lib
-          )
-
-      # ── Main run loop ─────────────────────────────────────────────────────
-      - name: Run WFO for ~5h50m, commit state every 5min, then handoff
+      - name: Run bot for ~5h50m with zero-downtime handoff, commit its files every 5min
         env:
           BOT_NAME: "wfo3"
+          AUTOMATE_BOT_TOKEN: ${{ secrets.AUTOMATE_BOT_TOKEN }}
+          AUTOMATE_ENCRYPTION_KEY: ${{ secrets.AUTOMATE_ENCRYPTION_KEY }}
+          AUTOMATE_CHAT_ID: ${{ secrets.AUTOMATE_CHAT_ID }}
           META_BOT_GITHUB_PAT: ${{ secrets.META_BOT_GITHUB_PAT }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          PUBLIC_REPO: ${{ github.event.repository.name }}
+          HANDOFF_MODE: ${{ github.event.action == 'prime-custombot-wfo3' && 'primer' || 'normal' }}
         run: |
           set -e
           cd private
-          git config user.email "wfo3@local"
-          git config user.name "WFO3 Bot"
+          git config user.email "custombot@local"
+          git config user.name "CustomBot ${BOT_NAME}"
 
-          WFO_DIR="freqtrade-core/user_data/custom_bots/Wfo"
-          USER_DATA="freqtrade-core/user_data"
+          BOT_DIR="freqtrade-core/user_data/custom_bots/${BOT_NAME}"
+          HANDOFF_FILE_PATH="freqtrade-core/user_data/handoff/${BOT_NAME}.json"
+          THIS_INSTANCE_ID="$(python3 -c 'import uuid; print(uuid.uuid4().hex[:12])')"
+          echo "This instance: ${THIS_INSTANCE_ID} (mode: ${HANDOFF_MODE})"
 
-          # ── Sync-and-commit helper (FIX: replaces silently-swallowed
-          # `git pull --rebase -q || true` / `git push -q || true`) ─────────
-          # Same fix as custombot-wfo.yml/custombot-wfo2.yml — see those
-          # files' versions of this function for the full explanation.
-          # Stages wfo3's own distinct state file (adb30_state_wfo3.json),
-          # matching its TITAN_STATE_FILE override above.
-          sync_and_commit_wfo_state() {
-            local commit_msg="$1"
-            local attempt
-            local _p
+          # --- Small helpers for reading/writing the handoff file via the
+          # GitHub Contents API directly (NOT via the local git clone —
+          # this file changes on a fast cadence during a handoff window
+          # and deserves its own narrow, independent transport rather than
+          # contending with the bot's own periodic commit-and-push loop
+          # below, which is already the single largest source of git
+          # 409/rebase churn in this whole system).
+          gh_get_handoff() {
+            curl -s -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/Miadol/contents/${HANDOFF_FILE_PATH}"
+          }
 
-            for _p in \
-              "${USER_DATA}/adb30_state_wfo3.json" \
-              "${USER_DATA}/wfo_results/" \
-              "${USER_DATA}/hyperopt_results/" \
-              "${USER_DATA}/wfo_masters/" \
-              "${USER_DATA}/research/" \
-              "${USER_DATA}/phoenix_calibration.json" \
-              "${USER_DATA}/strategies/" \
-              "${USER_DATA}/hyperopts/" \
-              "${USER_DATA}/configs/" \
-              "${WFO_DIR}/"
-            do
-              git add "$_p" 2>/dev/null || true
-            done
-
-            if git diff --cached --quiet; then
-              return 0
-            fi
-
-            git commit -m "${commit_msg}" -q || true
-
-            for attempt in 1 2 3 4 5; do
-              if ! git pull --rebase -q; then
-                echo "::warning::WFO3 state sync: git pull --rebase failed (attempt ${attempt}/5) — retrying."
-                git rebase --abort >/dev/null 2>&1 || true
-                sleep $((attempt * 3))
-                continue
+          gh_put_handoff() {
+            # $1 = base64 JSON content, $2 = commit message. Re-fetches
+            # SHA immediately before each attempt and retries on non-2xx,
+            # same pattern as meta_bot.py's own gh_put_file — a handoff
+            # write racing against another write (e.g. this same bot's
+            # periodic autosave commit touching a totally different path)
+            # must not be treated as fatal.
+            local content_b64="$1"
+            local message="$2"
+            for attempt in 1 2 3; do
+              sha=$(gh_get_handoff | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("sha","") if isinstance(d,dict) else "")' 2>/dev/null || echo "")
+              if [ -n "$sha" ]; then
+                body=$(python3 -c "import json,sys; print(json.dumps({'message': sys.argv[1], 'content': sys.argv[2], 'sha': sys.argv[3]}))" "$message" "$content_b64" "$sha")
+              else
+                body=$(python3 -c "import json,sys; print(json.dumps({'message': sys.argv[1], 'content': sys.argv[2]}))" "$message" "$content_b64")
               fi
-
-              if git push -q; then
+              http_code=$(curl -s -o /tmp/gh_put_resp.json -w "%{http_code}" \
+                -X PUT -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/Miadol/contents/${HANDOFF_FILE_PATH}" \
+                -d "$body")
+              if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
                 return 0
               fi
-
-              echo "::warning::WFO3 state sync: git push failed (attempt ${attempt}/5) — will re-pull and retry."
-              sleep $((attempt * 3))
+              sleep $((attempt * 2))
             done
-
-            echo "::error::WFO3 state sync FAILED after 5 attempts (${commit_msg}) — state is committed LOCALLY on this runner but has NOT reached GitHub."
+            echo "::warning::gh_put_handoff failed after 3 attempts (http=$http_code) — handoff will fall back to normal budget-exhaustion restart."
             return 1
           }
 
-          # ── Verify WFO directory structure exists ──────────────────────────
-          if [ ! -f "${WFO_DIR}/main.py" ]; then
-            echo "❌ ERROR: WFO main.py not found at ${WFO_DIR}/main.py"
-            ls -la "${WFO_DIR}/" || echo "Directory does not exist!"
-            exit 1
+          read_handoff_field() {
+            # $1 = field name. Empty string if file/field missing. Kept
+            # strictly single physical line (no embedded newline inside
+            # the -c string) — a multi-line Python string embedded
+            # directly in this YAML block scalar previously broke the
+            # block's own indentation contract (any physical line that
+            # dips to a shallower column than the block's established
+            # indentation ends the block early) and produced a "mapping
+            # values are not allowed here" / "could not find expected ':'"
+            # YAML parse error the moment BOT_NAME got substituted in and
+            # this became a real file. Semicolon-joined one-liners avoid
+            # that failure mode entirely, confirmed by re-parsing the
+            # fully-rendered file with PyYAML, not just eyeballing it.
+            gh_get_handoff | python3 -c "import sys,json,base64; d=json.load(sys.stdin); h=json.loads(base64.b64decode(d['content']).decode()); print(h.get('$1','') or '')" 2>/dev/null || echo ""
+          }
+
+          write_handoff_json() {
+            # $1 = fully-formed JSON string
+            local b64
+            b64=$(printf '%s' "$1" | base64 -w0)
+            gh_put_handoff "$b64" "handoff: ${BOT_NAME} update"
+          }
+
+          # ==================================================================
+          # PRIMER MODE: this job was dispatched specifically to warm up as
+          # the successor. It's already done its slow setup (clone + pip
+          # install, both prior steps). All that's left is to announce
+          # readiness and BLOCK — never starting bot.py until it reads back
+          # a "go" addressed to this exact THIS_INSTANCE_ID. The
+          # instance_id scoping (not just a bare boolean) is what prevents
+          # a stale/superseded primer from ever mistaking someone else's go
+          # for its own.
+          # ==================================================================
+          if [ "$HANDOFF_MODE" = "primer" ]; then
+            existing_primer_id=$(read_handoff_field primer_instance_id)
+            existing_phase=$(read_handoff_field phase)
+            if [ -n "$existing_primer_id" ] && [ "$existing_primer_id" != "$THIS_INSTANCE_ID" ] && [ "$existing_phase" != "idle" ] && [ -n "$existing_phase" ]; then
+              echo "Handoff slot already claimed by ${existing_primer_id} (phase=${existing_phase}) — this primer is stale, exiting without serving."
+              exit 0
+            fi
+
+            write_handoff_json "{\"phase\": \"ready\", \"primer_instance_id\": \"${THIS_INSTANCE_ID}\", \"go_ts\": null}"
+            echo "Primer ready (${THIS_INSTANCE_ID}) — waiting for go signal..."
+
+            DEADLINE=$(( $(date +%s) + 20*60 ))
+            GOT_GO="false"
+            while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+              sleep 5
+              cur_phase=$(read_handoff_field phase)
+              cur_primer=$(read_handoff_field primer_instance_id)
+              if [ "$cur_phase" = "go_sent" ] && [ "$cur_primer" = "$THIS_INSTANCE_ID" ]; then
+                echo "Go signal confirmed for ${THIS_INSTANCE_ID} — taking over."
+                GOT_GO="true"
+                write_handoff_json "{\"phase\": \"idle\", \"primer_instance_id\": null, \"go_ts\": null}"
+                break
+              fi
+              if [ "$cur_phase" = "idle" ]; then
+                echo "Handoff slot was reset by the outgoing process — abandoning."
+                exit 0
+              fi
+            done
+
+            if [ "$GOT_GO" != "true" ]; then
+              echo "No go signal within timeout — giving up. Outgoing process's own budget-exhaustion fallback covers continuity."
+              exit 0
+            fi
+            # Falls through into normal serving below, AS the new instance.
           fi
 
-          # ── Inject Telegram credentials ───────────────────────────────────
-          # Titan WFO reads TITAN_BOT_TOKEN and TITAN_CHAT_ID from env.
-          # These are stored as bot_token3.txt and chat_id.txt in the private
-          # repo (same pattern as all other custom bots), so they persist
-          # across restarts without needing GitHub secrets per bot.
-          # On first run: create these files manually in the private repo once.
-          export TITAN_BOT_TOKEN=$(cat "${WFO_DIR}/bot_token3.txt" 2>/dev/null || echo "")
-          export TITAN_CHAT_ID=$(cat "${WFO_DIR}/chat_id.txt" 2>/dev/null || echo "")
+          # Token and chat_id live in the private repo, same as exchange keys
+          # do for the Freqtrade bots — never a GitHub secret, since secrets
+          # can't be created per-bot dynamically without a separate API
+          # call+encryption step. This is simpler and just as safe since
+          # nothing here is reachable outside this one ephemeral runner.
+          #
+          # We export under EVERY common env var name that Telegram bot scripts
+          # tend to use. This means any custom bot script works out of the box
+          # regardless of what it calls its token var — no changes to the bot
+          # script ever needed for credential wiring.
+          #
+          # IF A FUTURE CUSTOM BOT'S TELEGRAM ISN'T WORKING: check what env
+          # var name it reads its token/chat_id from (grep for os.getenv or
+          # os.environ in the script), then just add that name to this block.
+          # Each runner job is fully isolated — no cross-bot contamination.
+          _TOKEN=$(cat "${BOT_DIR}/bot_token.txt")
+          _CHAT_ID=$(cat "${BOT_DIR}/chat_id.txt")
+          # Token — all common names
+          export BOT_TOKEN="$_TOKEN"
+          export TELEGRAM_BOT_TOKEN="$_TOKEN"
+          export TELEGRAM_TOKEN="$_TOKEN"
+          export TITAN_BOT_TOKEN="$_TOKEN"
+          export TG_TOKEN="$_TOKEN"
+          export TG_BOT_TOKEN="$_TOKEN"
+          # Chat ID — all common names
+          export CHAT_ID="$_CHAT_ID"
+          export TELEGRAM_CHAT_ID="$_CHAT_ID"
+          export TITAN_CHAT_ID="$_CHAT_ID"
+          export TG_CHAT_ID="$_CHAT_ID"
 
-          # Also export under all common aliases so any component that reads
-          # a different env var name still gets the right value.
-          export BOT_TOKEN="$TITAN_BOT_TOKEN"
-          export TELEGRAM_BOT_TOKEN="$TITAN_BOT_TOKEN"
-          export TG_TOKEN="$TITAN_BOT_TOKEN"
-          export CHAT_ID="$TITAN_CHAT_ID"
-          export TELEGRAM_CHAT_ID="$TITAN_CHAT_ID"
-          export TG_CHAT_ID="$TITAN_CHAT_ID"
-
-          # ── Point WFO at the shared user_data directory ───────────────────
-          # config.py auto-detects environment. On GitHub Actions none of the
-          # hardcoded paths (_DOCKER_DIR, _HOST_DIR, _PHONE_DIR) exist, so it
-          # falls through to "local" mode using the directory containing the
-          # script itself as base. We override with TITAN_USER_DIR to point it
-          # at the shared freqtrade-core/user_data instead, so strategies,
-          # configs, hyperopts, and results are all in the shared location.
-          export TITAN_USER_DIR="$(pwd)/${USER_DATA}"
-
-          # ── Instance-specific state/lock file names ───────────────────────
-          export TITAN_STATE_FILE="$(pwd)/${USER_DATA}/adb30_state_wfo3.json"
-          export TITAN_LOCK_FILE="/tmp/adb30_wfo3_commander.lock"
-          rm -f "$TITAN_LOCK_FILE"
-
-          # ── Start WFO from parent directory (NOT from within Wfo/) ────────
-          # FIX v31: Do NOT cd into WFO_DIR. Instead, set PYTHONPATH and run
-          # with full path. This ensures main.py can import config, handlers,
-          # etc. without import errors, and the working directory stays correct
-          # for all relative path operations.
-          export PYTHONPATH="${WFO_DIR}:${PYTHONPATH}"
-          python3 "${WFO_DIR}/main.py" &
-          WFO_PID=$!
+          # Arbitrary script — we genuinely don't know what it does or what
+          # it names its own state/db files, unlike the Freqtrade bots where
+          # we control the whole stack. Commit the WHOLE folder rather than
+          # a specific filename, since that's the only thing that's actually
+          # generic enough to work for any script.
+          (cd "$BOT_DIR" && python3 bot.py) &
+          BOT_PID=$!
 
           STOP_AFTER_SECONDS=$((5*3600 + 50*60))
+          HANDOFF_MARGIN_SECONDS=$((15*60))
           END_TIME=$(( $(date +%s) + STOP_AFTER_SECONDS ))
+          PRIMER_DISPATCHED="false"
+          EXIT_SENTINEL="normal"
 
           while [ "$(date +%s)" -lt "$END_TIME" ]; do
             sleep 300
-
-            if ! kill -0 "$WFO_PID" 2>/dev/null; then
-              echo "WFO process exited unexpectedly — stopping early."
+            if ! kill -0 "$BOT_PID" 2>/dev/null; then
+              echo "Bot process exited unexpectedly — stopping early."
               break
             fi
-
-            if ! git pull --rebase -q; then
-              echo "::warning::WFO3: pre-check git pull --rebase failed — control.json read this cycle may be stale. Will retry via the sync function below regardless."
-              git rebase --abort >/dev/null 2>&1 || true
-            fi
-
-            if [ -f "${WFO_DIR}/control.json" ] && grep -q '"restart_requested": *true' "${WFO_DIR}/control.json"; then
-              echo "Early restart requested by meta-bot — stopping."
+            git pull --rebase -q || true
+            if [ -f "${BOT_DIR}/control.json" ] && grep -q '"restart_requested": *true' "${BOT_DIR}/control.json"; then
+              echo "Early restart requested by meta-bot — stopping after this cycle."
               break
             fi
+            git add "$BOT_DIR"
+            git commit -m "autosave: periodic - ${BOT_NAME} - $(date -u)" -q || true
+            git push -q || true
 
-            # Commit all WFO3 state and result files every 5 minutes, via
-            # the retry-hardened helper defined above.
-            # This includes: adb30_state_wfo3.json, wfo_results/, hyperopt_results/,
-            # wfo_masters/, research/, phoenix_calibration.json.
-            # Strategies and hyperopts in user_data/strategies/ and
-            # user_data/hyperopts/ are also committed here so they're
-            # immediately available to live bots on their next restart.
-            sync_and_commit_wfo_state "autosave: wfo3 state - $(date -u)" || true
+            # --- Handoff: outgoing side, checked once per 5-min cycle ----
+            # (Custom bots don't long-poll Telegram the way meta-bot does,
+            # so there's no natural ~30s cadence to hook into — the
+            # existing 5-min autosave loop is the right cadence here. The
+            # gap this introduces is bounded by how close to END_TIME the
+            # margin is set, not by this poll interval, since dispatch
+            # happens as soon as we cross the margin on any 5-min tick.)
+            _time_left=$(( END_TIME - $(date +%s) ))
+            if [ "$PRIMER_DISPATCHED" = "false" ] && [ "$_time_left" -le "$HANDOFF_MARGIN_SECONDS" ]; then
+              PRIMER_DISPATCHED="true"
+              cur_phase=$(read_handoff_field phase)
+              if [ -z "$cur_phase" ] || [ "$cur_phase" = "idle" ]; then
+                write_handoff_json "{\"phase\": \"priming\", \"primer_instance_id\": null, \"go_ts\": null}"
+                curl -s -X POST \
+                  -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+                  -H "Accept: application/vnd.github.v3+json" \
+                  "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PUBLIC_REPO}/dispatches" \
+                  -d "{\"event_type\":\"prime-custombot-${BOT_NAME}\"}"
+                echo "Primer dispatched for ${BOT_NAME}."
+              fi
+            fi
+
+            if [ "$PRIMER_DISPATCHED" = "true" ]; then
+              cur_phase=$(read_handoff_field phase)
+              cur_primer=$(read_handoff_field primer_instance_id)
+              if [ "$cur_phase" = "ready" ] && [ -n "$cur_primer" ]; then
+                echo "Primer ${cur_primer} is ready — yielding now."
+                write_handoff_json "{\"phase\": \"go_sent\", \"primer_instance_id\": \"${cur_primer}\", \"go_ts\": true}"
+                EXIT_SENTINEL="handoff_yielded"
+                break
+              fi
+            fi
           done
 
-          # ── Graceful shutdown ─────────────────────────────────────────────
-          echo "Stopping WFO gracefully..."
-          kill -TERM "$WFO_PID" 2>/dev/null || true
-          wait "$WFO_PID" 2>/dev/null || true
+          echo "Stopping ${BOT_NAME} gracefully..."
+          kill -TERM "$BOT_PID" 2>/dev/null || true
+          wait "$BOT_PID" 2>/dev/null || true
 
-          # ── Final state commit ────────────────────────────────────────────
-          if [ -f "${WFO_DIR}/control.json" ]; then
-            PAUSED=$(grep -o '"paused": *true' "${WFO_DIR}/control.json" || echo "")
+          git pull --rebase -q || true
+          if [ -f "${BOT_DIR}/control.json" ]; then
+            PAUSED=$(grep -o '"paused": *true' "${BOT_DIR}/control.json" || echo "")
           else
             PAUSED=""
           fi
           if [ -n "$PAUSED" ]; then
-            echo '{"paused": true, "restart_requested": false}' > "${WFO_DIR}/control.json"
+            echo '{"paused": true, "restart_requested": false}' > "${BOT_DIR}/control.json"
           else
-            echo '{"paused": false, "restart_requested": false}' > "${WFO_DIR}/control.json"
+            echo '{"paused": false, "restart_requested": false}' > "${BOT_DIR}/control.json"
           fi
 
-          if ! sync_and_commit_wfo_state "autosave: wfo3 final commit - $(date -u)"; then
-            echo "::error::Final WFO3 commit FAILED after 5 attempts — state may not have persisted!"
+          git add "$BOT_DIR"
+          git commit -m "autosave: final commit before restart - ${BOT_NAME} - $(date -u)" -q || true
+          PUSH_OK=false
+          for attempt in 1 2 3 4 5; do
+            if git push -q; then
+              PUSH_OK=true
+              break
+            fi
+            git pull --rebase -q || true
+            sleep $((attempt * 2))
+          done
+          if [ "$PUSH_OK" = false ]; then
+            echo "::error::Final commit for ${BOT_NAME} FAILED after 5 attempts — state may not have persisted!"
           fi
 
-      # ── Schedule next run ─────────────────────────────────────────────────
-      # Same meta_restart check as live bots — meta-bot is sole restart
-      # authority when present; self-dispatch fires only as a fallback.
-      - name: Schedule next run
+          echo "$EXIT_SENTINEL" > /tmp/custombot_exit_reason_${BOT_NAME}
+
+      - name: Schedule next run (skipped on clean handoff — successor already live under a separate concurrency group)
         if: always()
         run: |
-          cd private
-          if ! git pull --rebase -q; then
-            echo "::warning::Schedule-next-run: git pull --rebase failed — control.json read below may be stale."
-            git rebase --abort >/dev/null 2>&1 || true
-          fi
-          WFO_DIR="freqtrade-core/user_data/custom_bots/Wfo"
+          cd private && git pull --rebase -q || true
+          BOT_DIR="freqtrade-core/user_data/custom_bots/wfo3"
 
-          if [ -f "${WFO_DIR}/control.json" ] && grep -q '"paused": *true' "${WFO_DIR}/control.json"; then
-            echo "WFO is paused — not scheduling next run."
+          if [ -f "/tmp/custombot_exit_reason_wfo3" ] && grep -q "handoff_yielded" "/tmp/custombot_exit_reason_wfo3"; then
+            echo "Clean handoff detected — successor already live under the '-primer' concurrency group. Skipping self-dispatch entirely (dispatching restart-custombot-wfo3 here would start a genuine competing third process, since the successor is NOT in this workflow's normal concurrency group)."
             exit 0
           fi
 
-          if [ -f "${WFO_DIR}/control.json" ] && grep -q '"meta_restart": *true' "${WFO_DIR}/control.json"; then
+          if [ -f "${BOT_DIR}/control.json" ] && grep -q '"paused": *true' "${BOT_DIR}/control.json"; then
+            echo "wfo3 is paused — not scheduling next run."
+            exit 0
+          fi
+
+          if [ -f "${BOT_DIR}/control.json" ] && grep -q '"meta_restart": *true' "${BOT_DIR}/control.json"; then
             echo "Meta-bot is handling this restart — skipping self-dispatch."
             exit 0
           fi
@@ -289,4 +320,4 @@ jobs:
             -H "Accept: application/vnd.github.v3+json" \
             https://api.github.com/repos/${{ github.repository }}/dispatches \
             -d '{"event_type":"restart-custombot-wfo3"}'
-          echo "Next WFO run triggered."
+          echo "Next run of wfo3 triggered."
