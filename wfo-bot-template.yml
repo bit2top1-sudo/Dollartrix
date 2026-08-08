@@ -33,6 +33,40 @@ jobs:
         run: |
           git clone https://x-access-token:${{ secrets.FREQTRADE_CORE_PAT }}@github.com/${{ github.repository_owner }}/Miadol.git private
 
+      # ── Self-heal: fill in any files missing from this bot's own folder ──
+      # Belt-and-suspenders alongside meta_bot.py's clone_wfo_source_files()
+      # verified-write fix: if this instance's folder is ever missing a
+      # file for any reason (an old partial clone, a manual edit gone
+      # wrong, a future regression), every run self-heals from the
+      # original 'wfo' template folder before install ever runs, instead
+      # of crash-looping on "Could not open requirements file" forever.
+      # Never overwrites a file that already exists — this bot's own code
+      # may have legitimately diverged from 'wfo' since creation.
+      - name: Self-heal missing bot files from wfo template
+        run: |
+          set -e
+          SRC="private/freqtrade-core/user_data/custom_bots/wfo"
+          DEST="private/freqtrade-core/user_data/custom_bots/{{WFO_FOLDER}}"
+          if [ ! -d "$SRC" ]; then
+            echo "::warning::Source 'wfo' template folder not found — cannot self-heal. Skipping."
+          else
+            mkdir -p "$DEST"
+            HEALED=""
+            for f in "$SRC"/*.py "$SRC/requirements.txt"; do
+              [ -e "$f" ] || continue
+              base="$(basename "$f")"
+              if [ ! -f "$DEST/$base" ]; then
+                cp "$f" "$DEST/$base"
+                HEALED="${HEALED}${base}, "
+              fi
+            done
+            if [ -n "$HEALED" ]; then
+              echo "::warning::Self-healed missing file(s) into {{WFO_FOLDER}} from 'wfo' template: ${HEALED%, }."
+            else
+              echo "{{WFO_FOLDER}}'s folder already has every file 'wfo' has — nothing to heal."
+            fi
+          fi
+
       # ── Restore OHLCV data from artifact ─────────────────────────────────
       # Deliberately a SINGLE SHARED artifact ("wfo-ohlcv-data") across
       # EVERY WFO bot instance, not one per bot — every WFO instance backtests
