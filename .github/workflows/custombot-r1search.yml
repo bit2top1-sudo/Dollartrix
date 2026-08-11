@@ -1,0 +1,454 @@
+name: WFO Bot - r1search
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [restart-custombot-r1search, prime-custombot-r1search]
+
+# Concurrency guard, split the same way every other handoff-capable
+# workflow in this repo is split: a primer warming up this bot's
+# successor must run in a SEPARATE group from the currently-live process,
+# or GitHub's cancel-in-progress would kill the still-live process the
+# instant the primer job starts, not once it's actually ready.
+concurrency:
+  group: ${{ github.event.action == 'prime-custombot-r1search' && 'custombot-r1search-primer' || 'custombot-r1search' }}
+  cancel-in-progress: true
+
+jobs:
+  run-wfo-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: Checkout public scaffold
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: public
+
+      - name: Clone private repo (Miadol)
+        run: |
+          git clone https://x-access-token:${{ secrets.FREQTRADE_CORE_PAT }}@github.com/${{ github.repository_owner }}/Miadol.git private
+
+      # ── Self-heal: fill in any files missing from this bot's own folder ──
+      # Belt-and-suspenders alongside meta_bot.py's clone_wfo_source_files()
+      # verified-write fix: if this instance's folder is ever missing a
+      # file for any reason (an old partial clone, a manual edit gone
+      # wrong, a future regression), every run self-heals from the
+      # original 'wfo' template folder before install ever runs, instead
+      # of crash-looping on "Could not open requirements file" forever.
+      # Never overwrites a file that already exists — this bot's own code
+      # may have legitimately diverged from 'wfo' since creation.
+      - name: Self-heal missing bot files from wfo template
+        run: |
+          set -e
+          SRC="private/freqtrade-core/user_data/custom_bots/wfo"
+          DEST="private/freqtrade-core/user_data/custom_bots/R1search"
+          if [ ! -d "$SRC" ]; then
+            echo "::warning::Source 'wfo' template folder not found — cannot self-heal. Skipping."
+          else
+            mkdir -p "$DEST"
+            HEALED=""
+            for f in "$SRC"/*.py "$SRC/requirements.txt"; do
+              [ -e "$f" ] || continue
+              base="$(basename "$f")"
+              if [ ! -f "$DEST/$base" ]; then
+                cp "$f" "$DEST/$base"
+                HEALED="${HEALED}${base}, "
+              fi
+            done
+            if [ -n "$HEALED" ]; then
+              echo "::warning::Self-healed missing file(s) into R1search from 'wfo' template: ${HEALED%, }."
+            else
+              echo "R1search's folder already has every file 'wfo' has — nothing to heal."
+            fi
+          fi
+
+      # ── Restore OHLCV data from artifact ─────────────────────────────────
+      # Deliberately a SINGLE SHARED artifact ("wfo-ohlcv-data") across
+      # EVERY WFO bot instance, not one per bot — every WFO instance backtests
+      # against the same market data, so a per-bot copy would just mean each
+      # new WFO bot you create redownloads/reproduces the same ~700MB for no
+      # reason. This is a genuine, deliberate difference from every other
+      # per-bot artifact in this repo (which ARE meant to be bot-specific) —
+      # worth knowing if you're ever debugging why WFO bots seem to "share"
+      # something across instances; that's intentional here.
+      - name: Restore OHLCV data artifact (shared across all WFO bots)
+        run: |
+          DATA_DIR="private/freqtrade-core/user_data/data"
+          mkdir -p "$DATA_DIR"
+
+          ARTIFACT_NAME="wfo-ohlcv-data"
+          RESPONSE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=${ARTIFACT_NAME}")
+          ARTIFACT_ID=$( (echo "$RESPONSE" | grep -o '"id":[0-9]*' || true) | head -1 | (grep -o '[0-9]*' || true) )
+
+          if [ -n "$ARTIFACT_ID" ]; then
+            echo "Found OHLCV artifact ID: $ARTIFACT_ID — downloading..."
+            HTTP_CODE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -L -w "%{http_code}" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}/zip" \
+              -o /tmp/ohlcv_artifact.zip)
+            if [ "$HTTP_CODE" = "200" ] && [ -s /tmp/ohlcv_artifact.zip ]; then
+              unzip -o /tmp/ohlcv_artifact.zip -d /tmp/ohlcv_extracted || true
+              if [ -f /tmp/ohlcv_extracted/ohlcv_data.tar.gz ]; then
+                tar -xzf /tmp/ohlcv_extracted/ohlcv_data.tar.gz -C "$DATA_DIR"
+                echo "OHLCV data restored ($(du -sh $DATA_DIR | cut -f1))."
+              else
+                echo "::warning::Artifact downloaded but ohlcv_data.tar.gz not found inside."
+              fi
+            else
+              echo "::warning::OHLCV artifact download failed (HTTP $HTTP_CODE) — WFO will auto-download data as needed."
+            fi
+            rm -f /tmp/ohlcv_artifact.zip
+          else
+            echo "No OHLCV artifact found — first run or artifact expired. WFO will download data as needed."
+          fi
+
+      # ── Install full stack (Freqtrade + hyperopt + WFO deps) ─────────────
+      - name: Install Freqtrade + hyperopt deps
+        run: |
+          pip install "freqtrade[hyperopt]" scipy numba bottleneck scikit-learn statsmodels \
+            aiohttp python-dotenv numpy
+          pip install ta-lib 2>/dev/null || (
+            sudo apt-get install -y build-essential wget &&
+            wget -q http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz &&
+            tar -xzf ta-lib-0.4.0-src.tar.gz &&
+            cd ta-lib && ./configure --prefix=/usr && make -j2 && sudo make install && cd .. &&
+            pip install ta-lib
+          )
+
+      # ── Main run loop ─────────────────────────────────────────────────────
+      - name: Run WFO for ~5h50m, commit state every 5min, then handoff
+        env:
+          BOT_NAME: "r1search"
+          WFO_FOLDER: "R1search"
+          META_BOT_GITHUB_PAT: ${{ secrets.META_BOT_GITHUB_PAT }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          PUBLIC_REPO: ${{ github.event.repository.name }}
+          HANDOFF_MODE: ${{ github.event.action == 'prime-custombot-r1search' && 'primer' || 'normal' }}
+        run: |
+          set -e
+          cd private
+          git config user.email "wfo@local"
+          git config user.name "WFO Bot ${BOT_NAME}"
+
+          WFO_DIR="freqtrade-core/user_data/custom_bots/${WFO_FOLDER}"
+          USER_DATA="freqtrade-core/user_data"
+          HANDOFF_FILE_PATH="${USER_DATA}/handoff/${BOT_NAME}.json"
+          THIS_INSTANCE_ID="$(python3 -c 'import uuid; print(uuid.uuid4().hex[:12])')"
+          echo "This instance: ${THIS_INSTANCE_ID} (mode: ${HANDOFF_MODE})"
+
+          # --- Handoff file helpers — identical pattern to
+          # custom-bot-template.yml / bot-template.yml. Same rationale for
+          # using the GitHub Contents API directly rather than the local git
+          # clone: this file changes on a fast cadence during a handoff
+          # window and deserves its own transport, separate from
+          # sync_and_commit_wfo_state's own periodic commit-and-push loop.
+          gh_get_handoff() {
+            curl -s -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/Miadol/contents/${HANDOFF_FILE_PATH}"
+          }
+
+          gh_put_handoff() {
+            local content_b64="$1"
+            local message="$2"
+            for attempt in 1 2 3; do
+              sha=$(gh_get_handoff | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("sha","") if isinstance(d,dict) else "")' 2>/dev/null || echo "")
+              if [ -n "$sha" ]; then
+                body=$(python3 -c "import json,sys; print(json.dumps({'message': sys.argv[1], 'content': sys.argv[2], 'sha': sys.argv[3]}))" "$message" "$content_b64" "$sha")
+              else
+                body=$(python3 -c "import json,sys; print(json.dumps({'message': sys.argv[1], 'content': sys.argv[2]}))" "$message" "$content_b64")
+              fi
+              http_code=$(curl -s -o /tmp/gh_put_resp.json -w "%{http_code}" \
+                -X PUT -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/Miadol/contents/${HANDOFF_FILE_PATH}" \
+                -d "$body")
+              if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
+                return 0
+              fi
+              sleep $((attempt * 2))
+            done
+            echo "::warning::gh_put_handoff failed after 3 attempts (http=$http_code) — handoff will fall back to normal budget-exhaustion restart."
+            return 1
+          }
+
+          read_handoff_field() {
+            gh_get_handoff | python3 -c "import sys,json,base64; d=json.load(sys.stdin); h=json.loads(base64.b64decode(d['content']).decode()); print(h.get('$1','') or '')" 2>/dev/null || echo ""
+          }
+
+          # ── Sync-and-commit helper (unchanged from the hand-tuned fix in
+          # custombot-wfo.yml — commit BEFORE pull-rebase, since WFO writes
+          # its state file directly to disk without staging/committing it
+          # itself, so `git pull --rebase` would otherwise refuse to run
+          # against unstaged changes to a tracked file EVERY cycle, not just
+          # on real contention. Retries 5x with backoff; a local commit is
+          # NEVER discarded even if all retries are exhausted — it's left in
+          # place for the next cycle to reconcile, loudly flagged via
+          # ::error:: rather than silently lost.) ──────────────────────────
+          sync_and_commit_wfo_state() {
+            local commit_msg="$1"
+            local attempt
+            local _p
+
+            for _p in \
+              "${USER_DATA}/adb30_state.json" \
+              "${USER_DATA}/wfo_results/" \
+              "${USER_DATA}/hyperopt_results/" \
+              "${USER_DATA}/wfo_masters/" \
+              "${USER_DATA}/research/" \
+              "${USER_DATA}/phoenix_calibration.json" \
+              "${USER_DATA}/strategies/" \
+              "${USER_DATA}/hyperopts/" \
+              "${USER_DATA}/configs/" \
+              "${WFO_DIR}/"
+            do
+              git add "$_p" 2>/dev/null || true
+            done
+
+            if git diff --cached --quiet; then
+              return 0
+            fi
+
+            git commit -m "${commit_msg}" -q || true
+
+            for attempt in 1 2 3 4 5; do
+              if ! git pull --rebase -q; then
+                echo "::warning::WFO state sync: git pull --rebase failed (attempt ${attempt}/5) — retrying."
+                git rebase --abort >/dev/null 2>&1 || true
+                sleep $((attempt * 3))
+                continue
+              fi
+
+              if git push -q; then
+                return 0
+              fi
+
+              echo "::warning::WFO state sync: git push failed (attempt ${attempt}/5) — will re-pull and retry."
+              sleep $((attempt * 3))
+            done
+
+            echo "::error::WFO state sync FAILED after 5 attempts (${commit_msg}) — state is committed LOCALLY on this runner but has NOT reached GitHub. It will be retried next cycle; if this keeps happening, check for a genuine conflict rather than a transient blip."
+            return 1
+          }
+
+          # ── Verify WFO directory structure exists ──────────────────────────
+          if [ ! -f "${WFO_DIR}/main.py" ]; then
+            echo "❌ ERROR: WFO main.py not found at ${WFO_DIR}/main.py"
+            ls -la "${WFO_DIR}/" || echo "Directory does not exist!"
+            exit 1
+          fi
+
+          # ==================================================================
+          # PRIMER MODE. Same shape as every other handoff in this repo (see
+          # bot-template.yml / custom-bot-template.yml for the full
+          # rationale). WFO doesn't hold open exchange positions the way a
+          # live trading bot does — its state (adb30_state.json,
+          # wfo_results/, etc.) is exactly the same kind of git-committed
+          # state a custom bot has, so this reuses the generic custom-bot
+          # handoff shape rather than needing the live-bot DB-snapshot
+          # re-pull-twice pattern.
+          # ==================================================================
+          if [ "$HANDOFF_MODE" = "primer" ]; then
+            existing_primer_id=$(read_handoff_field primer_instance_id)
+            existing_phase=$(read_handoff_field phase)
+            if [ -n "$existing_primer_id" ] && [ "$existing_primer_id" != "$THIS_INSTANCE_ID" ] && [ "$existing_phase" != "idle" ] && [ -n "$existing_phase" ]; then
+              echo "Handoff slot already claimed by ${existing_primer_id} (phase=${existing_phase}) — this primer is stale, exiting without serving."
+              exit 0
+            fi
+
+            write_handoff_json() {
+              local b64
+              b64=$(printf '%s' "$1" | base64 -w0)
+              gh_put_handoff "$b64" "handoff: ${BOT_NAME} update"
+            }
+            write_handoff_json "{\"phase\": \"ready\", \"primer_instance_id\": \"${THIS_INSTANCE_ID}\", \"go_ts\": null}"
+            echo "Primer ready (${THIS_INSTANCE_ID}) — waiting for go signal..."
+
+            DEADLINE=$(( $(date +%s) + 20*60 ))
+            GOT_GO="false"
+            while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+              sleep 5
+              cur_phase=$(read_handoff_field phase)
+              cur_primer=$(read_handoff_field primer_instance_id)
+              if [ "$cur_phase" = "go_sent" ] && [ "$cur_primer" = "$THIS_INSTANCE_ID" ]; then
+                echo "Go signal confirmed for ${THIS_INSTANCE_ID} — taking over."
+                GOT_GO="true"
+                write_handoff_json "{\"phase\": \"idle\", \"primer_instance_id\": null, \"go_ts\": null}"
+                git pull --rebase -q || true
+                break
+              fi
+              if [ "$cur_phase" = "idle" ]; then
+                echo "Handoff slot was reset by the outgoing process — abandoning."
+                exit 0
+              fi
+            done
+
+            if [ "$GOT_GO" != "true" ]; then
+              echo "No go signal within timeout — giving up. Outgoing process's own budget-exhaustion fallback covers continuity."
+              exit 0
+            fi
+          fi
+
+          # ── Inject Telegram credentials ───────────────────────────────────
+          # Titan WFO reads TITAN_BOT_TOKEN and TITAN_CHAT_ID from env.
+          export TITAN_BOT_TOKEN=$(cat "${WFO_DIR}/bot_token.txt" 2>/dev/null || echo "")
+          export TITAN_CHAT_ID=$(cat "${WFO_DIR}/chat_id.txt" 2>/dev/null || echo "")
+          export BOT_TOKEN="$TITAN_BOT_TOKEN"
+          export TELEGRAM_BOT_TOKEN="$TITAN_BOT_TOKEN"
+          export TG_TOKEN="$TITAN_BOT_TOKEN"
+          export CHAT_ID="$TITAN_CHAT_ID"
+          export TELEGRAM_CHAT_ID="$TITAN_CHAT_ID"
+          export TG_CHAT_ID="$TITAN_CHAT_ID"
+
+          # ── Point WFO at the shared user_data directory ───────────────────
+          export TITAN_USER_DIR="$(pwd)/${USER_DATA}"
+
+          rm -f "/tmp/adb30_wfo_commander_${BOT_NAME}.lock"
+
+          # ── Start WFO from parent directory (NOT from within its own dir) ──
+          export PYTHONPATH="${WFO_DIR}:${PYTHONPATH}"
+          python3 "${WFO_DIR}/main.py" &
+          WFO_PID=$!
+
+          STOP_AFTER_SECONDS=$((5*3600 + 50*60))
+          HANDOFF_MARGIN_SECONDS=$((15*60))
+          END_TIME=$(( $(date +%s) + STOP_AFTER_SECONDS ))
+          PRIMER_DISPATCHED="false"
+          EXIT_SENTINEL="normal"
+
+          while [ "$(date +%s)" -lt "$END_TIME" ]; do
+            sleep 300
+
+            if ! kill -0 "$WFO_PID" 2>/dev/null; then
+              echo "WFO process exited unexpectedly — stopping early."
+              break
+            fi
+
+            if ! git pull --rebase -q; then
+              echo "::warning::WFO: pre-check git pull --rebase failed — control.json read this cycle may be stale. Will retry via the sync function below regardless."
+              git rebase --abort >/dev/null 2>&1 || true
+            fi
+
+            if [ -f "${WFO_DIR}/control.json" ] && grep -q '"restart_requested": *true' "${WFO_DIR}/control.json"; then
+              echo "Early restart requested by meta-bot — stopping."
+              break
+            fi
+
+            sync_and_commit_wfo_state "autosave: wfo state - ${BOT_NAME} - $(date -u)" || true
+
+            # --- Handoff: outgoing side, checked once per 5-min cycle -----
+            _time_left=$(( END_TIME - $(date +%s) ))
+            if [ "$PRIMER_DISPATCHED" = "false" ] && [ "$_time_left" -le "$HANDOFF_MARGIN_SECONDS" ]; then
+              PRIMER_DISPATCHED="true"
+              cur_phase=$(read_handoff_field phase)
+              if [ -z "$cur_phase" ] || [ "$cur_phase" = "idle" ]; then
+                b64=$(printf '%s' "{\"phase\": \"priming\", \"primer_instance_id\": null, \"go_ts\": null}" | base64 -w0)
+                gh_put_handoff "$b64" "handoff: ${BOT_NAME} priming"
+                curl -s -X POST \
+                  -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+                  -H "Accept: application/vnd.github.v3+json" \
+                  "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PUBLIC_REPO}/dispatches" \
+                  -d "{\"event_type\":\"prime-custombot-${BOT_NAME}\"}"
+                echo "Primer dispatched for ${BOT_NAME}."
+              fi
+            fi
+
+            if [ "$PRIMER_DISPATCHED" = "true" ]; then
+              cur_phase=$(read_handoff_field phase)
+              cur_primer=$(read_handoff_field primer_instance_id)
+              if [ "$cur_phase" = "ready" ] && [ -n "$cur_primer" ]; then
+                echo "Primer ${cur_primer} is ready — final state sync, then yielding immediately."
+                sync_and_commit_wfo_state "autosave: wfo final pre-handoff sync - ${BOT_NAME} - $(date -u)" || true
+                b64=$(printf '%s' "{\"phase\": \"go_sent\", \"primer_instance_id\": \"${cur_primer}\", \"go_ts\": true}" | base64 -w0)
+                gh_put_handoff "$b64" "handoff: ${BOT_NAME} go"
+                EXIT_SENTINEL="handoff_yielded"
+                break
+              fi
+            fi
+          done
+
+          # ── Graceful shutdown ─────────────────────────────────────────────
+          echo "Stopping WFO gracefully..."
+          kill -TERM "$WFO_PID" 2>/dev/null || true
+          wait "$WFO_PID" 2>/dev/null || true
+
+          # ── Final state commit ────────────────────────────────────────────
+          if [ -f "${WFO_DIR}/control.json" ]; then
+            PAUSED=$(grep -o '"paused": *true' "${WFO_DIR}/control.json" || echo "")
+          else
+            PAUSED=""
+          fi
+          if [ -n "$PAUSED" ]; then
+            echo '{"paused": true, "restart_requested": false}' > "${WFO_DIR}/control.json"
+          else
+            echo '{"paused": false, "restart_requested": false}' > "${WFO_DIR}/control.json"
+          fi
+
+          if ! sync_and_commit_wfo_state "autosave: wfo final commit - ${BOT_NAME} - $(date -u)"; then
+            echo "::error::Final WFO commit FAILED after 5 attempts — state may not have persisted!"
+          fi
+
+          echo "$EXIT_SENTINEL" > "/tmp/wfo_exit_reason_${BOT_NAME}"
+
+      # ── Persist OHLCV data as artifact (shared across all WFO bots) ──────
+      - name: Save OHLCV artifact
+        if: always()
+        run: |
+          DATA_DIR="private/freqtrade-core/user_data/data"
+          if [ -d "$DATA_DIR" ] && [ "$(ls -A $DATA_DIR 2>/dev/null)" ]; then
+            echo "Tarballing OHLCV data ($(du -sh $DATA_DIR | cut -f1))..."
+            tar -czf /tmp/ohlcv_data.tar.gz -C "$DATA_DIR" .
+          else
+            echo "No OHLCV data to upload."
+            tar -czf /tmp/ohlcv_data.tar.gz -T /dev/null 2>/dev/null || touch /tmp/ohlcv_data.tar.gz
+          fi
+
+      - name: Upload OHLCV artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wfo-ohlcv-data
+          path: /tmp/ohlcv_data.tar.gz
+          overwrite: true
+          retention-days: 90
+          if-no-files-found: ignore
+
+      # ── Schedule next run (skipped on clean handoff) ──────────────────────
+      - name: Schedule next run
+        if: always()
+        run: |
+          cd private
+          if ! git pull --rebase -q; then
+            echo "::warning::Schedule-next-run: git pull --rebase failed — control.json read below may be stale."
+            git rebase --abort >/dev/null 2>&1 || true
+          fi
+          WFO_DIR="freqtrade-core/user_data/custom_bots/R1search"
+
+          if [ -f "/tmp/wfo_exit_reason_r1search" ] && grep -q "handoff_yielded" "/tmp/wfo_exit_reason_r1search"; then
+            echo "Clean handoff detected — successor already live under the '-primer' concurrency group. Skipping self-dispatch entirely."
+            exit 0
+          fi
+
+          if [ -f "${WFO_DIR}/control.json" ] && grep -q '"paused": *true' "${WFO_DIR}/control.json"; then
+            echo "r1search is paused — not scheduling next run."
+            exit 0
+          fi
+
+          if [ -f "${WFO_DIR}/control.json" ] && grep -q '"meta_restart": *true' "${WFO_DIR}/control.json"; then
+            echo "Meta-bot is handling this restart — skipping self-dispatch."
+            exit 0
+          fi
+
+          echo "No meta-bot claim found — self-dispatching as fallback."
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/dispatches \
+            -d '{"event_type":"restart-custombot-r1search"}'
+          echo "Next run of r1search triggered."
