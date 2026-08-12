@@ -317,9 +317,37 @@ jobs:
           WFO_PID=$!
 
           STOP_AFTER_SECONDS=$((5*3600 + 50*60))
-          HANDOFF_MARGIN_SECONDS=$((15*60))
+
+          # PREVENTIVE FIX (v67): handoff window widened + retrying.
+          #
+          # Root cause of a real incident: the old margin gave the ENTIRE
+          # primer sequence (dispatch -> runner queues -> clone -> pip
+          # install -> freqtrade startup -> reach "ready") a single
+          # 15-minute window, checked exactly once. Under any runner-queue
+          # delay or slow dependency install, the primer simply didn't
+          # make it to "ready" before END_TIME, this loop fell through to
+          # graceful shutdown with EXIT_SENTINEL still "normal" (never
+          # "handoff_yielded"), and Schedule-next-run correctly reported
+          # no clean handoff and fell back to a COLD self-dispatch —
+          # exactly the ~3 minute visible gap. That's curative-shaped: the
+          # bot silently ate the failure and fell back rather than trying
+          # to make the original plan actually succeed.
+          #
+          # Fix, preventive this time: start priming a full HOUR before
+          # end-of-run instead of 15 minutes, and if a dispatched primer
+          # doesn't reach "ready" within a reasonable sub-window, DON'T
+          # just wait passively for the clock to run out — re-dispatch a
+          # fresh primer attempt, up to 5 total attempts, before ever
+          # falling back to cold self-dispatch. A stuck/failed runner
+          # queue is usually transient; retrying gives it several
+          # independent chances to succeed instead of one.
+          HANDOFF_MARGIN_SECONDS=$((60*60))          # start priming 1h before end-of-run
+          HANDOFF_MAX_ATTEMPTS=5                      # up to 5 primer dispatch attempts
+          HANDOFF_RETRY_AFTER_SECONDS=$((10*60))      # re-dispatch if not "ready" within 10min of an attempt
           END_TIME=$(( $(date +%s) + STOP_AFTER_SECONDS ))
           PRIMER_DISPATCHED="false"
+          PRIMER_ATTEMPTS=0
+          PRIMER_LAST_DISPATCH_TS=0
           EXIT_SENTINEL="normal"
 
           while [ "$(date +%s)" -lt "$END_TIME" ]; do
@@ -343,19 +371,25 @@ jobs:
             sync_and_commit_wfo_state "autosave: wfo state - ${BOT_NAME} - $(date -u)" || true
 
             # --- Handoff: outgoing side, checked once per 5-min cycle -----
-            _time_left=$(( END_TIME - $(date +%s) ))
+            _now=$(date +%s)
+            _time_left=$(( END_TIME - _now ))
+
+            # Enter the priming window (widened to 1h). Dispatch the
+            # first primer attempt as soon as we're inside the window.
             if [ "$PRIMER_DISPATCHED" = "false" ] && [ "$_time_left" -le "$HANDOFF_MARGIN_SECONDS" ]; then
               PRIMER_DISPATCHED="true"
               cur_phase=$(read_handoff_field phase)
               if [ -z "$cur_phase" ] || [ "$cur_phase" = "idle" ]; then
+                PRIMER_ATTEMPTS=$((PRIMER_ATTEMPTS + 1))
+                PRIMER_LAST_DISPATCH_TS=$_now
                 b64=$(printf '%s' "{\"phase\": \"priming\", \"primer_instance_id\": null, \"go_ts\": null}" | base64 -w0)
-                gh_put_handoff "$b64" "handoff: ${BOT_NAME} priming"
+                gh_put_handoff "$b64" "handoff: ${BOT_NAME} priming (attempt ${PRIMER_ATTEMPTS}/${HANDOFF_MAX_ATTEMPTS})"
                 curl -s -X POST \
                   -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
                   -H "Accept: application/vnd.github.v3+json" \
                   "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PUBLIC_REPO}/dispatches" \
                   -d "{\"event_type\":\"prime-custombot-${BOT_NAME}\"}"
-                echo "Primer dispatched for ${BOT_NAME}."
+                echo "Primer dispatched for ${BOT_NAME} (attempt ${PRIMER_ATTEMPTS}/${HANDOFF_MAX_ATTEMPTS})."
               fi
             fi
 
@@ -369,6 +403,33 @@ jobs:
                 gh_put_handoff "$b64" "handoff: ${BOT_NAME} go"
                 EXIT_SENTINEL="handoff_yielded"
                 break
+              fi
+
+              # Retry logic: if we've been waiting on THIS attempt for
+              # longer than the retry window and it still isn't ready
+              # (still "priming"/stuck, or somehow reset to "idle" — e.g.
+              # the primer's own job failed outright), and we haven't
+              # exhausted our attempt budget yet, and there's still
+              # enough time left for another attempt to plausibly land
+              # before END_TIME, fire another primer dispatch rather than
+              # silently waiting out the clock on a possibly-dead attempt.
+              _since_last_dispatch=$(( _now - PRIMER_LAST_DISPATCH_TS ))
+              if [ "$cur_phase" != "ready" ] \
+                 && [ "$_since_last_dispatch" -ge "$HANDOFF_RETRY_AFTER_SECONDS" ] \
+                 && [ "$PRIMER_ATTEMPTS" -lt "$HANDOFF_MAX_ATTEMPTS" ] \
+                 && [ "$_time_left" -gt "$HANDOFF_RETRY_AFTER_SECONDS" ]; then
+                PRIMER_ATTEMPTS=$((PRIMER_ATTEMPTS + 1))
+                PRIMER_LAST_DISPATCH_TS=$_now
+                echo "::warning::Primer still not ready after ${_since_last_dispatch}s (phase=${cur_phase:-<empty>}) — re-dispatching, attempt ${PRIMER_ATTEMPTS}/${HANDOFF_MAX_ATTEMPTS}."
+                b64=$(printf '%s' "{\"phase\": \"priming\", \"primer_instance_id\": null, \"go_ts\": null}" | base64 -w0)
+                gh_put_handoff "$b64" "handoff: ${BOT_NAME} priming retry (attempt ${PRIMER_ATTEMPTS}/${HANDOFF_MAX_ATTEMPTS})"
+                curl -s -X POST \
+                  -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+                  -H "Accept: application/vnd.github.v3+json" \
+                  "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PUBLIC_REPO}/dispatches" \
+                  -d "{\"event_type\":\"prime-custombot-${BOT_NAME}\"}"
+              elif [ "$cur_phase" != "ready" ] && [ "$PRIMER_ATTEMPTS" -ge "$HANDOFF_MAX_ATTEMPTS" ] && [ "$_since_last_dispatch" -ge "$HANDOFF_RETRY_AFTER_SECONDS" ]; then
+                echo "::warning::Primer still not ready after ${PRIMER_ATTEMPTS}/${HANDOFF_MAX_ATTEMPTS} attempts — giving up on pre-warmed handoff for this cycle; Schedule-next-run will fall back to cold self-dispatch as before."
               fi
             fi
           done
@@ -424,9 +485,47 @@ jobs:
         if: always()
         run: |
           cd private
+
+          # PREVENTIVE FIX (v67): dirty-tree rebase hardening.
+          #
+          # Root cause of a real incident: if the earlier "Run bot"
+          # step's own final sync_and_commit_wfo_state exhausted its 5
+          # retries (logged as "::error:: Final WFO commit FAILED"), it
+          # deliberately leaves any local commit/changes in place rather
+          # than discarding them (see that function's own comment — data
+          # safety over cleanliness). That's the right call for not
+          # losing state, but it means THIS step's plain `git pull
+          # --rebase` can legitimately fail on a dirty tree that isn't
+          # going anywhere, and the old code's response — abort and
+          # press on — left control.json reads silently stale for the
+          # rest of this step (risk of a wrong pause/meta_restart read,
+          # not just a cosmetic warning).
+          #
+          # By this point in the job WFO itself is already fully
+          # `wait`-ed on and stopped (see the previous step) — nothing
+          # legitimate is still writing to this workspace — so it's now
+          # safe to make this specific read path resilient: if a plain
+          # rebase fails, stash any local changes out of the way (never
+          # discarded — `git stash` keeps them recoverable) purely so
+          # this step's own read of control.json is CURRENT rather than
+          # stale, then restore the stash afterward so nothing already
+          # committed-but-unpushed from the run step is silently lost.
           if ! git pull --rebase -q; then
-            echo "::warning::Schedule-next-run: git pull --rebase failed — control.json read below may be stale."
+            echo "::warning::Schedule-next-run: git pull --rebase failed — attempting stash-and-retry so control.json read below is current rather than stale."
             git rebase --abort >/dev/null 2>&1 || true
+            _stashed="false"
+            if ! git diff --quiet || ! git diff --cached --quiet; then
+              git stash push -u -m "schedule-next-run: pre-existing local changes" -q && _stashed="true"
+            fi
+            if git pull --rebase -q; then
+              echo "Schedule-next-run: pull succeeded after stashing local changes — control.json read below is current."
+            else
+              echo "::warning::Schedule-next-run: pull still failed even after stashing — control.json read below may still be stale. Proceeding with best-available local copy rather than blocking the whole step."
+              git rebase --abort >/dev/null 2>&1 || true
+            fi
+            if [ "$_stashed" = "true" ]; then
+              git stash pop -q || echo "::warning::Schedule-next-run: stash pop failed — local changes remain stashed (not lost) for the next cycle to reconcile."
+            fi
           fi
           WFO_DIR="freqtrade-core/user_data/custom_bots/{{WFO_FOLDER}}"
 
