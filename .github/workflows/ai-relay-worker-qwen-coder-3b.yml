@@ -1,0 +1,310 @@
+name: CustomBot Worker - ai_relay/qwen-coder-3b
+
+# TEMPLATE FILE -- not run directly. The controller (bot.py, register_worker())
+# stamps this out to .github/workflows/ai-relay-worker-qwen-coder-3b.yml with
+# every {{...}} token substituted, the same way meta_bot.py already generates
+# custombot-*.yml files from bot-template.yml / custom-bot-template.yml. One
+# file per registered model in models_registry.json -- never a shared/parameterized
+# workflow_dispatch input, so that each model gets its OWN independent
+# concurrency group and can never be cancelled by another model's primer/restart
+# cycle. See ai_relay/README.md "V3 worker architecture" section for the full
+# rationale.
+#
+# A worker is deliberately NOT a Telegram bot. It has no bot token, no
+# getUpdates poll loop, and no chat UI of its own -- the controller (ai_relay
+# itself) is the only Telegram surface in this whole system. A worker's only
+# two jobs are: (1) keep ONE specific Ollama model warm and idle-served for
+# its ~5h50m window, and (2) drain a small file-drop command queue
+# (queue/qwen-coder-3b/pending -> processing -> done) so the controller can
+# ask it things -- chat turns, /status-equivalent stats, /diag, live log
+# tail, dmesg OOM check -- in near-real-time without needing a direct network
+# path to an isolated Actions runner (same "no public IP, so use the
+# git-committed queue as the inbound channel" reasoning as ollama_worker_bot.py
+# and ai_relay's own existing optional queue/ channel).
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [restart-worker-qwen-coder-3b, prime-worker-qwen-coder-3b]
+
+concurrency:
+  group: ${{ github.event.action == 'prime-worker-qwen-coder-3b' && 'ai-relay-worker-qwen-coder-3b-primer' || 'ai-relay-worker-qwen-coder-3b' }}
+  cancel-in-progress: true
+
+jobs:
+  run-model-worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: Clone private repo (Miadol)
+        run: |
+          git clone https://x-access-token:${{ secrets.FREQTRADE_CORE_PAT }}@github.com/${{ github.repository_owner }}/Miadol.git private
+
+      - name: Install worker dependencies
+        run: |
+          cd private/freqtrade-core/user_data/custom_bots/ai_relay
+          pip install -r requirements.txt
+
+      - name: Run model worker for ~5h50m with zero-downtime handoff
+        env:
+          MODEL_SLUG: "qwen-coder-3b"
+          OLLAMA_TAG: "qwen2.5-coder:3b"
+          CONTROLLER_SLUG: "ai_relay"
+          AUTOMATE_ENCRYPTION_KEY: ${{ secrets.AUTOMATE_ENCRYPTION_KEY }}
+          META_BOT_GITHUB_PAT: ${{ secrets.META_BOT_GITHUB_PAT }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          PUBLIC_REPO: ${{ github.event.repository.name }}
+          HANDOFF_MODE: ${{ github.event.action == 'prime-worker-qwen-coder-3b' && 'primer' || 'normal' }}
+          OLLAMA_NUM_THREAD: ${{ vars.OLLAMA_NUM_THREAD || '4' }}
+        run: |
+          set -e
+          cd private
+          git config user.email "custombot@local"
+          git config user.name "ai_relay worker qwen-coder-3b"
+
+          WORKER_DIR="freqtrade-core/user_data/custom_bots/ai_relay"
+          HANDOFF_FILE_PATH="freqtrade-core/user_data/handoff/ai_relay_worker_qwen-coder-3b.json"
+          THIS_INSTANCE_ID="$(python3 -c 'import uuid; print(uuid.uuid4().hex[:12])')"
+          echo "Worker instance: ${THIS_INSTANCE_ID} model=${OLLAMA_TAG} (mode: ${HANDOFF_MODE})"
+
+          # --- Handoff read/write helpers -- IDENTICAL pattern to
+          # ai-relay.yml's own gh_get_handoff/gh_put_handoff/read_handoff_field,
+          # just pointed at this worker's own handoff file path so N workers'
+          # handoff cycles never collide with each other or with the
+          # controller's own handoff file.
+          gh_get_handoff() {
+            curl -s -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/Miadol/contents/${HANDOFF_FILE_PATH}"
+          }
+
+          gh_put_handoff() {
+            local content_b64="$1"
+            local message="$2"
+            for attempt in 1 2 3; do
+              sha=$(gh_get_handoff | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("sha","") if isinstance(d,dict) else "")' 2>/dev/null || echo "")
+              if [ -n "$sha" ]; then
+                body=$(python3 -c "import json,sys; print(json.dumps({'message': sys.argv[1], 'content': sys.argv[2], 'sha': sys.argv[3]}))" "$message" "$content_b64" "$sha")
+              else
+                body=$(python3 -c "import json,sys; print(json.dumps({'message': sys.argv[1], 'content': sys.argv[2]}))" "$message" "$content_b64")
+              fi
+              http_code=$(curl -s -o /tmp/gh_put_resp.json -w "%{http_code}" \
+                -X PUT -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/Miadol/contents/${HANDOFF_FILE_PATH}" \
+                -d "$body")
+              if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
+                return 0
+              fi
+              sleep $((attempt * 2))
+            done
+            echo "::warning::gh_put_handoff failed after 3 attempts (http=$http_code) for worker qwen-coder-3b -- falls back to normal budget-exhaustion restart."
+            return 1
+          }
+
+          read_handoff_field() {
+            gh_get_handoff | python3 -c "import sys,json,base64; d=json.load(sys.stdin); h=json.loads(base64.b64decode(d['content']).decode()); print(h.get('$1','') or '')" 2>/dev/null || echo ""
+          }
+
+          write_handoff_json() {
+            local b64
+            b64=$(printf '%s' "$1" | base64 -w0)
+            gh_put_handoff "$b64" "handoff: worker qwen-coder-3b update"
+          }
+
+          # ==================================================================
+          # PRIMER MODE -- identical shape to ai-relay.yml's own primer block.
+          # ==================================================================
+          if [ "$HANDOFF_MODE" = "primer" ]; then
+            existing_primer_id=$(read_handoff_field primer_instance_id)
+            existing_phase=$(read_handoff_field phase)
+            if [ -n "$existing_primer_id" ] && [ "$existing_primer_id" != "$THIS_INSTANCE_ID" ] && [ "$existing_phase" != "idle" ] && [ -n "$existing_phase" ]; then
+              echo "Handoff slot already claimed by ${existing_primer_id} (phase=${existing_phase}) -- this primer is stale, exiting without serving."
+              exit 0
+            fi
+
+            write_handoff_json "{\"phase\": \"ready\", \"primer_instance_id\": \"${THIS_INSTANCE_ID}\", \"go_ts\": null}"
+            echo "Primer ready (${THIS_INSTANCE_ID}) -- waiting for go signal..."
+
+            DEADLINE=$(( $(date +%s) + 20*60 ))
+            GOT_GO="false"
+            while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+              sleep 5
+              cur_phase=$(read_handoff_field phase)
+              cur_primer=$(read_handoff_field primer_instance_id)
+              if [ "$cur_phase" = "go_sent" ] && [ "$cur_primer" = "$THIS_INSTANCE_ID" ]; then
+                echo "Go signal confirmed for ${THIS_INSTANCE_ID} -- taking over."
+                GOT_GO="true"
+                write_handoff_json "{\"phase\": \"idle\", \"primer_instance_id\": null, \"go_ts\": null}"
+                break
+              fi
+              if [ "$cur_phase" = "idle" ]; then
+                echo "Handoff slot was reset by the outgoing process -- abandoning."
+                exit 0
+              fi
+            done
+
+            if [ "$GOT_GO" != "true" ]; then
+              echo "No go signal within timeout -- giving up. Outgoing process's own budget-exhaustion fallback covers continuity."
+              exit 0
+            fi
+          fi
+
+          # Launch this worker's own dedicated model process. worker_bot.py
+          # reads MODEL_SLUG/OLLAMA_TAG from env -- see ai_relay/worker_bot.py.
+          (cd "$WORKER_DIR" && python3 worker_bot.py) &
+          BOT_PID=$!
+
+          STOP_AFTER_SECONDS=$((5*3600 + 50*60))
+          HANDOFF_MARGIN_SECONDS=$((15*60))
+          END_TIME=$(( $(date +%s) + STOP_AFTER_SECONDS ))
+          PRIMER_DISPATCHED="false"
+          EXIT_SENTINEL="normal"
+
+          while [ "$(date +%s)" -lt "$END_TIME" ]; do
+            sleep 300
+            if ! kill -0 "$BOT_PID" 2>/dev/null; then
+              # Worker process is gone. Two very different reasons land here:
+              # (a) an actual crash (model crash, OOM-kill, pull failure), or
+              # (b) V3 PASS 2: a clean exit after a "stop" queue command --
+              # worker_bot.py's own main loop already wrote phase="stopped"
+              # to state/qwen-coder-3b.json and returned normally in this
+              # case, it did not crash. Tell these apart by checking the
+              # registry's paused flag (the controller always sets paused
+              # BEFORE sending "stop" -- see bot.py's pause_worker()) rather
+              # than by inspecting the exit code, since a normal Python
+              # return and a clean sys.exit(0) are indistinguishable from
+              # kill -0 alone, and $? isn't reliably available for a
+              # backgrounded PID by the time this poll notices it's gone.
+              # Kept as a single physical line, same YAML block-scalar
+              # indentation reasoning as the PAUSED check further below.
+              _stop_paused=$(python3 -c "import json,sys; reg=json.load(open('${WORKER_DIR}/models_registry.json')); m=[x for x in reg['models'] if x['slug']=='qwen-coder-3b']; print('true' if (m and m[0].get('paused')) else 'false')" 2>/dev/null || echo "false")
+              if [ "$_stop_paused" = "true" ]; then
+                echo "Worker process for qwen-coder-3b exited after a stop command (registry shows paused) -- clean stop, not a crash."
+                EXIT_SENTINEL="stopped_clean"
+              else
+                # CRITICAL: this must NEVER propagate as a failure of the
+                # outer job in a way that touches any sibling worker or the
+                # controller -- each worker workflow is already fully
+                # isolated by its own concurrency group and its own runner
+                # VM, so a crash here only ever affects this one model's own
+                # slot in the registry. The "Schedule next run" step below
+                # still fires (if: always()) and marks this slug's registry
+                # entry unhealthy with full crash detail rather than
+                # silently vanishing.
+                echo "Worker process for qwen-coder-3b exited unexpectedly -- stopping early, will report crash detail."
+              fi
+              break
+            fi
+            git pull --rebase -q || true
+            git add "$WORKER_DIR"
+            git commit -m "autosave: periodic - worker qwen-coder-3b - $(date -u)" -q || true
+            git push -q || true
+
+            _time_left=$(( END_TIME - $(date +%s) ))
+            if [ "$PRIMER_DISPATCHED" = "false" ] && [ "$_time_left" -le "$HANDOFF_MARGIN_SECONDS" ]; then
+              PRIMER_DISPATCHED="true"
+              cur_phase=$(read_handoff_field phase)
+              if [ -z "$cur_phase" ] || [ "$cur_phase" = "idle" ]; then
+                write_handoff_json "{\"phase\": \"priming\", \"primer_instance_id\": null, \"go_ts\": null}"
+                curl -s -X POST \
+                  -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+                  -H "Accept: application/vnd.github.v3+json" \
+                  "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PUBLIC_REPO}/dispatches" \
+                  -d "{\"event_type\":\"prime-worker-qwen-coder-3b\"}"
+                echo "Primer dispatched for worker qwen-coder-3b."
+              fi
+            fi
+
+            if [ "$PRIMER_DISPATCHED" = "true" ]; then
+              cur_phase=$(read_handoff_field phase)
+              cur_primer=$(read_handoff_field primer_instance_id)
+              if [ "$cur_phase" = "ready" ] && [ -n "$cur_primer" ]; then
+                echo "Primer ${cur_primer} is ready -- yielding now."
+                write_handoff_json "{\"phase\": \"go_sent\", \"primer_instance_id\": \"${cur_primer}\", \"go_ts\": true}"
+                EXIT_SENTINEL="handoff_yielded"
+                break
+              fi
+            fi
+          done
+
+          echo "Stopping worker qwen-coder-3b gracefully..."
+          kill -TERM "$BOT_PID" 2>/dev/null || true
+          wait "$BOT_PID" 2>/dev/null || true
+
+          git pull --rebase -q || true
+          git add "$WORKER_DIR"
+          git commit -m "autosave: final commit before restart - worker qwen-coder-3b - $(date -u)" -q || true
+          PUSH_OK=false
+          for attempt in 1 2 3 4 5; do
+            if git push -q; then
+              PUSH_OK=true
+              break
+            fi
+            git pull --rebase -q || true
+            sleep $((attempt * 2))
+          done
+          if [ "$PUSH_OK" = false ]; then
+            echo "::error::Final commit for worker qwen-coder-3b FAILED after 5 attempts -- state may not have persisted!"
+          fi
+
+          echo "$EXIT_SENTINEL" > /tmp/worker_exit_reason_qwen-coder-3b
+
+      - name: Schedule next run / report crash (skipped on clean handoff)
+        if: always()
+        run: |
+          cd private && git pull --rebase -q || true
+          WORKER_DIR="freqtrade-core/user_data/custom_bots/ai_relay"
+
+          if [ -f "/tmp/worker_exit_reason_qwen-coder-3b" ] && grep -q "handoff_yielded" "/tmp/worker_exit_reason_qwen-coder-3b"; then
+            echo "Clean handoff for worker qwen-coder-3b -- successor already live under the '-primer' concurrency group. Skipping self-dispatch."
+            exit 0
+          fi
+
+          # V3 PASS 2: same suppression pattern as handoff_yielded above,
+          # reused rather than reinvented (per the plan's explicit
+          # instruction) -- a "stop" queue command already means the
+          # controller deliberately wants this slot down, so no successor
+          # should be dispatched. This check is technically redundant with
+          # the PAUSED check a few lines below (pause_worker() always sets
+          # paused BEFORE sending stop, so PAUSED will also be "true" here)
+          # but is kept as an explicit, separately-logged branch so the
+          # workflow run's own log clearly says WHY it didn't self-dispatch
+          # rather than silently falling through to the generic paused
+          # message below.
+          if [ -f "/tmp/worker_exit_reason_qwen-coder-3b" ] && grep -q "stopped_clean" "/tmp/worker_exit_reason_qwen-coder-3b"; then
+            echo "Worker qwen-coder-3b exited via an explicit stop command -- skipping self-dispatch."
+            exit 0
+          fi
+
+          # Registry-driven pause check: the CONTROLLER is the source of
+          # truth for pause/enable state (models_registry.json), not a
+          # per-worker control.json -- this is the key difference from the
+          # single-bot ai-relay.yml, since here N workers all need to agree
+          # with ONE controller about who should currently be running.
+          # Kept strictly single physical line -- same reason as
+          # ai-relay.yml's own read_handoff_field comment: a multi-line
+          # Python string embedded directly in this YAML block scalar
+          # breaks the block's indentation contract the moment any
+          # physical line dips to a shallower column, producing a
+          # "could not find expected ':'" YAML parse error once
+          # qwen-coder-3b gets substituted in and this becomes a real
+          # file. Confirmed by re-parsing the fully-rendered file with
+          # PyYAML, not just eyeballing it.
+          PAUSED=$(python3 -c "import json,sys; reg=json.load(open('${WORKER_DIR}/models_registry.json')); m=[x for x in reg['models'] if x['slug']=='qwen-coder-3b']; print('true' if (m and m[0].get('paused')) else 'false')" 2>/dev/null || echo "false")
+          if [ "$PAUSED" = "true" ]; then
+            echo "Worker qwen-coder-3b is paused in the registry -- not scheduling next run."
+            exit 0
+          fi
+
+          echo "No clean handoff -- self-dispatching worker qwen-coder-3b as fallback (also covers crash-and-restart)."
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/dispatches \
+            -d '{"event_type":"restart-worker-qwen-coder-3b"}'
+          echo "Next run of worker qwen-coder-3b triggered."
