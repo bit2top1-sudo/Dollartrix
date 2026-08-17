@@ -49,6 +49,23 @@ jobs:
           cd private/freqtrade-core/user_data/custom_bots/ai_relay
           pip install -r requirements.txt
 
+      # V3 PASS 4: cloudflared quick-tunnel binary -- worker_bot.py's
+      # _launch_cloudflared_tunnel() shells out to CLOUDFLARED_BIN
+      # (defaults to just "cloudflared" on PATH), so it needs to exist on
+      # this runner before the worker process starts. Direct binary
+      # download straight to /usr/local/bin rather than apt-get: no
+      # account/login/DNS setup needed for a quick tunnel (same
+      # no-registration property that made cloudflared the pick over a
+      # long-lived named tunnel), and this avoids an apt-add-repository +
+      # apt-get update round trip on every single worker run for a
+      # single static binary.
+      - name: Install cloudflared
+        run: |
+          curl -fsSL -o /usr/local/bin/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x /usr/local/bin/cloudflared
+          cloudflared --version
+
       - name: Run model worker for ~5h50m with zero-downtime handoff
         env:
           MODEL_SLUG: "deepseek-r1-14b"
