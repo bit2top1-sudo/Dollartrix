@@ -200,10 +200,57 @@ jobs:
               fi
               break
             fi
-            git pull --rebase -q || true
-            git add "$WORKER_DIR"
-            git commit -m "autosave: periodic - worker deepseek-r1-14b - $(date -u)" -q || true
-            git push -q || true
+            # V11: this used to be a single unretried pull-rebase/add/
+            # commit/push, all silently `|| true`'d. With up to 10 worker
+            # slots plus the controller itself all autosaving to the same
+            # Miadol main branch on the same 5-minute cadence, a rebase
+            # losing the race (another worker/the controller landed a
+            # commit in the same window) meant the following push was
+            # GUARANTEED to be rejected -- and with no retry, that
+            # rejection just repeated every single tick for the rest of
+            # this worker's ~5h50m run, hundreds of times, never once
+            # recovering. Confirmed from real run logs: dozens of
+            # consecutive "[rejected] main -> main (fetch first)" blocks,
+            # one per 300s tick. Matches the SAME retry shape the final
+            # commit-before-restart below already uses (attempt loop,
+            # re-pull-rebase between attempts) -- that path already
+            # tolerates this contention correctly; this is just bringing
+            # the periodic path up to the same standard rather than
+            # inventing a new pattern.
+            _autosave_ok=false
+            for _autosave_attempt in 1 2 3; do
+              git pull --rebase -q
+              _pull_rc=$?
+              if [ $_pull_rc -ne 0 ]; then
+                # A real rebase failure (not just "nothing new") leaves a
+                # conflicted/half-rebased working tree -- committing on
+                # top of that would be worse than skipping this tick, so
+                # abort back to a clean state and let the NEXT tick (or
+                # the final commit's own retry loop) try again from
+                # scratch, rather than compounding a bad state.
+                git rebase --abort 2>/dev/null || true
+                echo "::warning::worker deepseek-r1-14b autosave: git pull --rebase failed (attempt ${_autosave_attempt}/3, rc=${_pull_rc}) -- aborted rebase, will retry."
+                sleep $((_autosave_attempt * 3))
+                continue
+              fi
+              git add "$WORKER_DIR"
+              git commit -m "autosave: periodic - worker deepseek-r1-14b - $(date -u)" -q || true
+              if git push -q; then
+                _autosave_ok=true
+                break
+              fi
+              echo "::warning::worker deepseek-r1-14b autosave: git push rejected (attempt ${_autosave_attempt}/3) -- will re-pull and retry."
+              sleep $((_autosave_attempt * 3))
+            done
+            if [ "$_autosave_ok" = false ]; then
+              # Not fatal to the worker itself -- worker_bot.py's own
+              # in-memory state carries it through to the next tick or
+              # the final commit either way (same reasoning the old
+              # `|| true` relied on) -- but now this is a visible
+              # annotation instead of a silently swallowed failure
+              # repeating unnoticed for hours.
+              echo "::warning::worker deepseek-r1-14b autosave: all 3 attempts failed this tick -- will retry next tick (300s)."
+            fi
 
             _time_left=$(( END_TIME - $(date +%s) ))
             if [ "$PRIMER_DISPATCHED" = "false" ] && [ "$_time_left" -le "$HANDOFF_MARGIN_SECONDS" ]; then
