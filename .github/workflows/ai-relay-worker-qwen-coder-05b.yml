@@ -219,8 +219,28 @@ jobs:
             # inventing a new pattern.
             _autosave_ok=false
             for _autosave_attempt in 1 2 3; do
-              git pull --rebase -q
-              _pull_rc=$?
+              # V11-FIX: the original v11 patch used `git pull --rebase -q`
+              # with NO `|| true` here, relying on capturing $? on the very
+              # next line -- but this script has `set -e` at the top, and
+              # set -e kills the script the INSTANT any unguarded command
+              # returns nonzero, before the next line (the $? capture) ever
+              # runs. Reproduced directly: a dirty working tree (unstaged
+              # changes present from the worker process's own in-flight
+              # writes at the exact moment this fires -- an ordinary,
+              # expected state, not a rare edge case) made `git pull
+              # --rebase` exit 128, and set -e terminated the whole step
+              # immediately with that raw exit code -- exactly the
+              # "Process completed with exit code 128" failure this caused
+              # in production. Fix: wrap the command in the if/else itself,
+              # which IS `set -e`-safe (a command directly in an `if`
+              # condition never triggers set -e, by design), and capture
+              # the real exit code from there instead of a separate $?
+              # read afterward.
+              if git pull --rebase -q; then
+                _pull_rc=0
+              else
+                _pull_rc=$?
+              fi
               if [ $_pull_rc -ne 0 ]; then
                 # A real rebase failure (not just "nothing new") leaves a
                 # conflicted/half-rebased working tree -- committing on
@@ -283,7 +303,27 @@ jobs:
           kill -TERM "$BOT_PID" 2>/dev/null || true
           wait "$BOT_PID" 2>/dev/null || true
 
+          # V11-FIX: same reasoning as ai-relay.yml's identical fix --
+          # `git pull --rebase` refuses on a dirty tree, which this
+          # almost always is right after the worker process exits
+          # (in-flight session/queue/state writes). Stash-pull-pop lets
+          # the pull actually run instead of being silently skipped every
+          # time by the old `|| true` -- but a plain pop can leave literal
+          # conflict markers in a file if the stashed change conflicts
+          # with what was pulled (confirmed by testing against a real
+          # conflicting-pull scenario, not just the dirty-tree case) --
+          # detect that (`UU` in git status) and reset to the clean
+          # post-pull tree rather than ever letting conflict markers reach
+          # a commit.
+          git stash -q --include-untracked || true
           git pull --rebase -q || true
+          if ! git stash pop -q 2>/dev/null; then
+            if [ -n "$(git status --short | grep '^UU')" ]; then
+              echo "::warning::worker qwen-coder-05b: stash pop conflicted with pulled changes -- discarding in-flight local write, keeping pulled state clean."
+              git reset --hard HEAD -q
+            fi
+            git stash drop -q 2>/dev/null || true
+          fi
           git add "$WORKER_DIR"
           git commit -m "autosave: final commit before restart - worker qwen-coder-05b - $(date -u)" -q || true
           PUSH_OK=false
