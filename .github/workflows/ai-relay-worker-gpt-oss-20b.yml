@@ -209,33 +209,46 @@ jobs:
             # GUARANTEED to be rejected -- and with no retry, that
             # rejection just repeated every single tick for the rest of
             # this worker's ~5h50m run, hundreds of times, never once
-            # recovering. Confirmed from real run logs: dozens of
-            # consecutive "[rejected] main -> main (fetch first)" blocks,
-            # one per 300s tick. Matches the SAME retry shape the final
-            # commit-before-restart below already uses (attempt loop,
-            # re-pull-rebase between attempts) -- that path already
-            # tolerates this contention correctly; this is just bringing
-            # the periodic path up to the same standard rather than
-            # inventing a new pattern.
+            # recovering.
+            #
+            # V14: V11/V12 retried this loop but never fixed WHY the pull
+            # was failing in the first place -- confirmed from real run
+            # logs (three separate screenshots, same worker, same tick):
+            # `git pull --rebase` was run BEFORE `git add`/`git commit`,
+            # every attempt, and worker_bot.py's own write_heartbeat()
+            # rewrites state/gpt-oss-20b.json every
+            # HEARTBEAT_EVERY_SECONDS (3s) on a loop fully independent of
+            # this 300s autosave tick -- so by the time this block fires,
+            # the tree already has ~100 uncommitted heartbeat writes sitting
+            # in it, deterministically, every single tick. `git pull
+            # --rebase` refuses outright against ANY dirty tree
+            # ("cannot pull with rebase: You have unstaged changes",
+            # rc=128) -- this is not a transient condition the retry loop
+            # could ever get past: all 3 attempts fail identically, because
+            # nothing between attempts changes the precondition. One
+            # observed run was outright CANCELLED after this repeated
+            # 3-attempts-failed cycle, not just noisy.
+            #
+            # Fix: stash the dirty tree BEFORE pulling (not commit-then-
+            # pull -- baking heartbeat writes into a commit first would
+            # mean that commit has to survive a rebase against whatever
+            # landed upstream, which is the same rebase-conflict exposure
+            # this whole retry structure exists to absorb, just moved
+            # earlier; stashing keeps the pull itself operating on a clean
+            # tree so it can actually succeed, then restores the writes
+            # afterward). A plain `stash pop` can still leave literal
+            # conflict markers in a file if the popped change conflicts
+            # with what was just pulled (proven in the shutdown-path fix
+            # below, same reasoning) -- detect that (`UU` in git status)
+            # and `git reset --hard HEAD` back to the clean post-pull tree
+            # rather than ever letting conflict markers reach a commit.
+            # Losing one tick's worth of heartbeat/queue writes is a
+            # trivial cost; corrupting state/gpt-oss-20b.json with
+            # conflict markers is not -- every downstream reader parses it
+            # as JSON.
             _autosave_ok=false
             for _autosave_attempt in 1 2 3; do
-              # V11-FIX: the original v11 patch used `git pull --rebase -q`
-              # with NO `|| true` here, relying on capturing $? on the very
-              # next line -- but this script has `set -e` at the top, and
-              # set -e kills the script the INSTANT any unguarded command
-              # returns nonzero, before the next line (the $? capture) ever
-              # runs. Reproduced directly: a dirty working tree (unstaged
-              # changes present from the worker process's own in-flight
-              # writes at the exact moment this fires -- an ordinary,
-              # expected state, not a rare edge case) made `git pull
-              # --rebase` exit 128, and set -e terminated the whole step
-              # immediately with that raw exit code -- exactly the
-              # "Process completed with exit code 128" failure this caused
-              # in production. Fix: wrap the command in the if/else itself,
-              # which IS `set -e`-safe (a command directly in an `if`
-              # condition never triggers set -e, by design), and capture
-              # the real exit code from there instead of a separate $?
-              # read afterward.
+              git stash -q --include-untracked || true
               if git pull --rebase -q; then
                 _pull_rc=0
               else
@@ -243,15 +256,23 @@ jobs:
               fi
               if [ $_pull_rc -ne 0 ]; then
                 # A real rebase failure (not just "nothing new") leaves a
-                # conflicted/half-rebased working tree -- committing on
-                # top of that would be worse than skipping this tick, so
-                # abort back to a clean state and let the NEXT tick (or
-                # the final commit's own retry loop) try again from
-                # scratch, rather than compounding a bad state.
+                # conflicted/half-rebased working tree -- restore the
+                # stash is unsafe here too, so abort the rebase, drop back
+                # to a clean state, and let the NEXT tick (or the final
+                # commit's own retry loop) try again from scratch, rather
+                # than compounding a bad state.
                 git rebase --abort 2>/dev/null || true
+                git stash pop -q 2>/dev/null || git stash drop -q 2>/dev/null || true
                 echo "::warning::worker gpt-oss-20b autosave: git pull --rebase failed (attempt ${_autosave_attempt}/3, rc=${_pull_rc}) -- aborted rebase, will retry."
                 sleep $((_autosave_attempt * 3))
                 continue
+              fi
+              if ! git stash pop -q 2>/dev/null; then
+                if [ -n "$(git status --short | grep '^UU')" ]; then
+                  echo "::warning::worker gpt-oss-20b autosave: stash pop conflicted with pulled changes -- discarding this tick's in-flight writes, keeping pulled state clean."
+                  git reset --hard HEAD -q
+                fi
+                git stash drop -q 2>/dev/null || true
               fi
               git add "$WORKER_DIR"
               git commit -m "autosave: periodic - worker gpt-oss-20b - $(date -u)" -q || true
