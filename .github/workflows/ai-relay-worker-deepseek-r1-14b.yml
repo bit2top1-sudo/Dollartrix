@@ -14,13 +14,24 @@ name: CustomBot Worker - ai_relay/deepseek-r1-14b
 # getUpdates poll loop, and no chat UI of its own -- the controller (ai_relay
 # itself) is the only Telegram surface in this whole system. A worker's only
 # two jobs are: (1) keep ONE specific Ollama model warm and idle-served for
-# its ~5h50m window, and (2) drain a small file-drop command queue
-# (queue/deepseek-r1-14b/pending -> processing -> done) so the controller can
-# ask it things -- chat turns, /status-equivalent stats, /diag, live log
-# tail, dmesg OOM check -- in near-real-time without needing a direct network
-# path to an isolated Actions runner (same "no public IP, so use the
-# git-committed queue as the inbound channel" reasoning as ollama_worker_bot.py
-# and ai_relay's own existing optional queue/ channel).
+# its ~5h50m window, and (2) serve the real-time command channel -- chat
+# turns, /status-equivalent stats, /diag, live log tail, dmesg OOM check --
+# over a Cloudflare Quick Tunnel fronting worker_bot.py's own relay shim
+# (POST /relay/chat, POST /relay/state), with the tunnel's current public
+# URL published to the private repo via the GitHub Contents API so the
+# controller (no direct network path to an isolated Actions runner) knows
+# where to reach it. V3 PASS 4: the file-drop git-queue this worker used to
+# poll (queue/deepseek-r1-14b/pending -> processing -> done) and the periodic
+# git-push heartbeat autosave are both RETIRED as of this pass -- see
+# worker_bot.py's own WORKER_CODE_VERSION comment and bot.py's
+# worker_read_state()/send_worker_command_git_queue() docstrings for why
+# (confirmed git contention across concurrent worker slots could wedge an
+# entire worker run indefinitely). Nothing in this template pushes to the
+# private repo on any periodic cadence anymore; the only repo writes left
+# are the one-shot tunnel-URL publish (worker_bot.py's own
+# publish_tunnel_urls(), over the Contents API, not a git push from this
+# shell) and the controller-driven registry/workflow-file management that
+# already lived in bot.py before this pass.
 
 on:
   workflow_dispatch:
@@ -217,99 +228,38 @@ jobs:
               fi
               break
             fi
-            # V11: this used to be a single unretried pull-rebase/add/
-            # commit/push, all silently `|| true`'d. With up to 10 worker
-            # slots plus the controller itself all autosaving to the same
-            # Miadol main branch on the same 5-minute cadence, a rebase
-            # losing the race (another worker/the controller landed a
-            # commit in the same window) meant the following push was
-            # GUARANTEED to be rejected -- and with no retry, that
-            # rejection just repeated every single tick for the rest of
-            # this worker's ~5h50m run, hundreds of times, never once
-            # recovering.
+            # V3 PASS 4: the periodic git-push autosave tick that used to
+            # live here (stash/pull --rebase/commit/push, retried 3x every
+            # 300s for the worker's whole ~5h50m run) is REMOVED, not just
+            # fixed again. History: V11 added retry, V14 fixed the
+            # underlying dirty-tree-vs-rebase precondition bug (stash
+            # before pull) -- both real fixes, but the fundamental problem
+            # was structural, not a bug in the retry logic itself: up to
+            # 10 worker slots plus the controller all autosaving to the
+            # SAME Miadol main branch on the SAME 5-minute cadence is
+            # guaranteed lock/rebase contention under load, and this loop
+            # ran in the same foreground shell that backgrounds
+            # worker_bot.py -- a wedged git command here (confirmed live:
+            # a real run's autosave tick got stuck retrying indefinitely,
+            # no further ticks, no crash, just silently frozen) hangs the
+            # ENTIRE worker step in place for the rest of its ~5h50m
+            # window, with no way to detect or recover from it externally.
             #
-            # V14: V11/V12 retried this loop but never fixed WHY the pull
-            # was failing in the first place -- confirmed from real run
-            # logs (three separate screenshots, same worker, same tick):
-            # `git pull --rebase` was run BEFORE `git add`/`git commit`,
-            # every attempt, and worker_bot.py's own write_heartbeat()
-            # rewrites state/deepseek-r1-14b.json every
-            # HEARTBEAT_EVERY_SECONDS (3s) on a loop fully independent of
-            # this 300s autosave tick -- so by the time this block fires,
-            # the tree already has ~100 uncommitted heartbeat writes sitting
-            # in it, deterministically, every single tick. `git pull
-            # --rebase` refuses outright against ANY dirty tree
-            # ("cannot pull with rebase: You have unstaged changes",
-            # rc=128) -- this is not a transient condition the retry loop
-            # could ever get past: all 3 attempts fail identically, because
-            # nothing between attempts changes the precondition. One
-            # observed run was outright CANCELLED after this repeated
-            # 3-attempts-failed cycle, not just noisy.
-            #
-            # Fix: stash the dirty tree BEFORE pulling (not commit-then-
-            # pull -- baking heartbeat writes into a commit first would
-            # mean that commit has to survive a rebase against whatever
-            # landed upstream, which is the same rebase-conflict exposure
-            # this whole retry structure exists to absorb, just moved
-            # earlier; stashing keeps the pull itself operating on a clean
-            # tree so it can actually succeed, then restores the writes
-            # afterward). A plain `stash pop` can still leave literal
-            # conflict markers in a file if the popped change conflicts
-            # with what was just pulled (proven in the shutdown-path fix
-            # below, same reasoning) -- detect that (`UU` in git status)
-            # and `git reset --hard HEAD` back to the clean post-pull tree
-            # rather than ever letting conflict markers reach a commit.
-            # Losing one tick's worth of heartbeat/queue writes is a
-            # trivial cost; corrupting state/deepseek-r1-14b.json with
-            # conflict markers is not -- every downstream reader parses it
-            # as JSON.
-            _autosave_ok=false
-            for _autosave_attempt in 1 2 3; do
-              git stash -q --include-untracked || true
-              if git pull --rebase -q; then
-                _pull_rc=0
-              else
-                _pull_rc=$?
-              fi
-              if [ $_pull_rc -ne 0 ]; then
-                # A real rebase failure (not just "nothing new") leaves a
-                # conflicted/half-rebased working tree -- restore the
-                # stash is unsafe here too, so abort the rebase, drop back
-                # to a clean state, and let the NEXT tick (or the final
-                # commit's own retry loop) try again from scratch, rather
-                # than compounding a bad state.
-                git rebase --abort 2>/dev/null || true
-                git stash pop -q 2>/dev/null || git stash drop -q 2>/dev/null || true
-                echo "::warning::worker deepseek-r1-14b autosave: git pull --rebase failed (attempt ${_autosave_attempt}/3, rc=${_pull_rc}) -- aborted rebase, will retry."
-                sleep $((_autosave_attempt * 3))
-                continue
-              fi
-              if ! git stash pop -q 2>/dev/null; then
-                if [ -n "$(git status --short | grep '^UU')" ]; then
-                  echo "::warning::worker deepseek-r1-14b autosave: stash pop conflicted with pulled changes -- discarding this tick's in-flight writes, keeping pulled state clean."
-                  git reset --hard HEAD -q
-                fi
-                git stash drop -q 2>/dev/null || true
-              fi
-              git add "$WORKER_DIR"
-              git commit -m "autosave: periodic - worker deepseek-r1-14b - $(date -u)" -q || true
-              if git push -q; then
-                _autosave_ok=true
-                break
-              fi
-              echo "::warning::worker deepseek-r1-14b autosave: git push rejected (attempt ${_autosave_attempt}/3) -- will re-pull and retry."
-              sleep $((_autosave_attempt * 3))
-            done
-            if [ "$_autosave_ok" = false ]; then
-              # Not fatal to the worker itself -- worker_bot.py's own
-              # in-memory state carries it through to the next tick or
-              # the final commit either way (same reasoning the old
-              # `|| true` relied on) -- but now this is a visible
-              # annotation instead of a silently swallowed failure
-              # repeating unnoticed for hours.
-              echo "::warning::worker deepseek-r1-14b autosave: all 3 attempts failed this tick -- will retry next tick (300s)."
-            fi
-
+            # This is safe to remove because nothing reads what it wrote
+            # anymore: worker_bot.py's own state/<slug>.json and queue/
+            # writes used to need a channel back to the controller
+            # (bot.py's worker_read_state(), git-queue command handling)
+            # before the Cloudflare tunnel migration -- both are now
+            # retired call paths (see bot.py's worker_read_state() and
+            # send_worker_command_git_queue() docstrings, kept as
+            # intentionally-dead cold-fallback reference code, not
+            # deleted). Live state now flows over the same tunnel every
+            # other live command uses (POST /relay/state ->
+            # worker_read_state_http() on the controller side), computed
+            # fresh per request, zero git writes, zero contention with any
+            # other worker or the controller. The one-time final commit at
+            # shutdown (further below in this same step) is removed for
+            # the identical reason.
             _time_left=$(( END_TIME - $(date +%s) ))
             if [ "$PRIMER_DISPATCHED" = "false" ] && [ "$_time_left" -le "$HANDOFF_MARGIN_SECONDS" ]; then
               PRIMER_DISPATCHED="true"
@@ -341,41 +291,20 @@ jobs:
           kill -TERM "$BOT_PID" 2>/dev/null || true
           wait "$BOT_PID" 2>/dev/null || true
 
-          # V11-FIX: same reasoning as ai-relay.yml's identical fix --
-          # `git pull --rebase` refuses on a dirty tree, which this
-          # almost always is right after the worker process exits
-          # (in-flight session/queue/state writes). Stash-pull-pop lets
-          # the pull actually run instead of being silently skipped every
-          # time by the old `|| true` -- but a plain pop can leave literal
-          # conflict markers in a file if the stashed change conflicts
-          # with what was pulled (confirmed by testing against a real
-          # conflicting-pull scenario, not just the dirty-tree case) --
-          # detect that (`UU` in git status) and reset to the clean
-          # post-pull tree rather than ever letting conflict markers reach
-          # a commit.
-          git stash -q --include-untracked || true
-          git pull --rebase -q || true
-          if ! git stash pop -q 2>/dev/null; then
-            if [ -n "$(git status --short | grep '^UU')" ]; then
-              echo "::warning::worker deepseek-r1-14b: stash pop conflicted with pulled changes -- discarding in-flight local write, keeping pulled state clean."
-              git reset --hard HEAD -q
-            fi
-            git stash drop -q 2>/dev/null || true
-          fi
-          git add "$WORKER_DIR"
-          git commit -m "autosave: final commit before restart - worker deepseek-r1-14b - $(date -u)" -q || true
-          PUSH_OK=false
-          for attempt in 1 2 3 4 5; do
-            if git push -q; then
-              PUSH_OK=true
-              break
-            fi
-            git pull --rebase -q || true
-            sleep $((attempt * 2))
-          done
-          if [ "$PUSH_OK" = false ]; then
-            echo "::error::Final commit for worker deepseek-r1-14b FAILED after 5 attempts -- state may not have persisted!"
-          fi
+          # V3 PASS 4: the final "autosave" commit+push that used to run
+          # here (stash/pull --rebase/commit/push, retried up to 5x) is
+          # REMOVED, same reasoning as the periodic mid-run tick removed
+          # above in this same step -- nothing reads state/<slug>.json or
+          # queue/ off the private repo anymore (see that removal's own
+          # comment, and bot.py's worker_read_state()/
+          # send_worker_command_git_queue() docstrings). This was a
+          # smaller risk than the every-300s tick (runs once, not
+          # hundreds of times per worker lifetime) but the same
+          # underlying contention exists here too -- up to 10 workers'
+          # shutdown-time pushes landing on the same branch in the same
+          # narrow handoff/restart window -- so it is removed rather than
+          # kept "just in case", per the same git-free direction as the
+          # rest of this pass.
 
           echo "$EXIT_SENTINEL" > /tmp/worker_exit_reason_deepseek-r1-14b
 
