@@ -84,6 +84,21 @@ jobs:
             pip install ta-lib
           )
 
+      # ── Install Ollama (local Auto Research providers) ────────────────────
+      # ubuntu-latest does not ship Ollama. Needed for the two selectable
+      # local AR providers (🖥️ Local: Qwen Coder 7B/14B) — see
+      # ollama_local.py's start_ollama_server(), called from handlers.py's
+      # main() right after Telegram starts. Unconditional (not gated
+      # behind a flag/Variable, unlike Miaie's cloudflared install) since
+      # these two providers are meant to be available out of the box, the
+      # same way the rest of Auto Research's cloud providers are — a
+      # local model just doesn't need a pasted key to become usable.
+      # Official install script; a few seconds of install time on every
+      # run either way.
+      - name: Install Ollama
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+
       # ── Main run loop ─────────────────────────────────────────────────────
       - name: Run WFO for ~5h50m, commit state every 5min, then handoff
         env:
@@ -266,6 +281,19 @@ jobs:
 
             if ! kill -0 "$WFO_PID" 2>/dev/null; then
               echo "WFO process exited unexpectedly — stopping early."
+              # The python3 process that would normally send this via
+              # self.tg.send is the very thing that just died -- send a
+              # direct curl notice instead so this isn't only ever visible
+              # in the Actions log. No auto-restart here (unlike Miaie's
+              # bounded-restart loop) — per instruction, WFO should report
+              # a crash and stay stopped so the workload can be reduced
+              # manually before the next scheduled run picks it back up
+              # (see the "Schedule next run" step at the end of this
+              # workflow, which still fires normally either way).
+              curl -s -X POST "https://api.telegram.org/bot${TITAN_BOT_TOKEN}/sendMessage" \
+                -d "chat_id=${TITAN_CHAT_ID}" \
+                -d "text=🔴 WFO's python3 process was killed at the OS level (likely OOM) and this job is stopping early rather than restarting. It will resume on its normal next-scheduled run -- check the Actions log, and consider reducing the workload (fewer active AR providers, a smaller local model, etc.) before then." \
+                > /dev/null || true
               break
             fi
 
