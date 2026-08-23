@@ -2,7 +2,7 @@
   "session_id": "89b4e286bd",
   "chat_id": "7390835094",
   "created_at": "2026-08-23T19:07:30.596082+00:00",
-  "updated_at": "2026-08-23T19:29:50.625571+00:00",
+  "updated_at": "2026-08-23T19:29:53.163214+00:00",
   "title": "My Disciple Died Yet Again_ A Compilation.epub",
   "source_label": "My Disciple Died Yet Again_ A Compilation.epub",
   "source_kind": "document",
@@ -7604,6 +7604,6 @@
       "doc_file_id": null
     }
   ],
-  "status": "in_progress",
+  "status": "stopped_by_user",
   "resume_attempts": 0
 }
