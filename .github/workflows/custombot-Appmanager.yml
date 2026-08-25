@@ -40,7 +40,6 @@ jobs:
           AUTOMATE_BOT_TOKEN: ${{ secrets.AUTOMATE_BOT_TOKEN }}
           AUTOMATE_ENCRYPTION_KEY: ${{ secrets.AUTOMATE_ENCRYPTION_KEY }}
           AUTOMATE_CHAT_ID: ${{ secrets.AUTOMATE_CHAT_ID }}
-          APP_MANAGER_PRIVATE_KEY_PEM: ${{ secrets.APP_MANAGER_PRIVATE_KEY_PEM }}
           META_BOT_GITHUB_PAT: ${{ secrets.META_BOT_GITHUB_PAT }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
           PUBLIC_REPO: ${{ github.event.repository.name }}
